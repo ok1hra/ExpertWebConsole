@@ -1,0 +1,1342 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EXPERT 1K-FA</title>
+<!-- Umozni spustit konzoli jako samostatnou aplikaci bez adresniho radku
+     a zalozek. V prohlizeci pres "Instalovat aplikaci", na iOS pres
+     "Pridat na plochu". -->
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<meta name="theme-color" content="#12151a">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="1K-FA">
+<style>
+  :root {
+    --bg:#12151a; --panel:#1b2028; --panel2:#232936; --line:#2f3745;
+    --fg:#dfe6ef; --dim:#8b97a8;
+    --green:#3ddc84; --yellow:#f5d048; --red:#ff5c5c;
+    --cyan:#4fd6e8; --white:#eef3f9; --sand:#e3c88b; --grey:#8e9aab;
+    --fw:#3fa96e;               /* ztlumena zelen pro dopredny vykon */
+    --rev:#cfa54e;              /* tmavsi piskova zluta pro odrazeny vykon */
+    /* Buttons reuse the bar colours: --fw for green, --rev for sand.
+       One colour means one thing, wherever it appears. */
+    --mono:ui-monospace,"DejaVu Sans Mono",Menlo,Consolas,monospace;
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; padding:12px; background:var(--bg); color:var(--fg);
+    font:13px/1.45 var(--mono);
+  }
+  .wrap { max-width:1100px; margin:0 auto; display:grid; gap:10px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:10px; }
+
+  /* --- top bar ------------------------------------------------------ */
+  .top { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+  .dot { width:11px; height:11px; border-radius:50%; background:var(--red);
+         flex:none; transition:background .2s; }
+  .dot.ok { background:var(--green); }
+  .top .leds { margin-left:auto; }
+
+  /* --- buttons ------------------------------------------------------- */
+  button {
+    font:inherit; font-weight:700; color:var(--fg); background:var(--panel2);
+    border:1px solid var(--line); border-radius:4px; padding:9px 14px;
+    cursor:pointer; letter-spacing:.04em;
+  }
+  button:hover:not(:disabled) { background:#2c3444; border-color:#465264; }
+  button:active:not(:disabled) { transform:translateY(1px); }
+  button:disabled { opacity:.35; cursor:not-allowed; }
+  button.wide { grid-column:1/-1; }
+  button.acc  { color:var(--cyan); }
+  /* Tlacitka v hornim radku ukazuji STAV, ne akci: klik prepina. */
+  button.st-off { color:var(--dim); border-color:var(--line); }
+  button.st-on  { color:var(--fw);  border-color:#2a5f42; }
+  /* OPERATE and PWR-H are the states in which the amplifier is actually
+     working, so they are inverted and cannot be overlooked. */
+  button.st-op  { background:var(--fw);  border-color:var(--fw);  color:#0c0f14; }
+  button.st-hi  { background:var(--rev); border-color:var(--rev); color:#0c0f14; }
+  button.st-op:hover, button.st-hi:hover { filter:brightness(1.12); }
+
+  /* --- warning ------------------------------------------------------- */
+  .warn { background:#4a1416; border:1px solid var(--red); color:#ffc9c9;
+          padding:8px 10px; border-radius:4px; font-size:12px; }
+
+  /* --- bars ---------------------------------------------------------- */
+  .bars { display:grid; gap:8px; }
+  /* Two rows: label, bar and value in the first, the scale underneath in the
+     second. There is no frame around the bar - the unlit LEDs already mark its
+     extent, so an extra line only gets in the way. */
+  .bar { display:grid; grid-template-columns:38px 1fr 108px;
+         gap:0 9px; align-items:center; }
+  .bar > * { grid-row:1; }
+  .bar .lbl { font-size:12px; font-weight:700; color:var(--dim); letter-spacing:.1em; }
+  .bar .track { position:relative; height:26px; }
+  .bar .scale { grid-row:2; grid-column:2; position:relative; height:13px; }
+  .bar .scale span { position:absolute; top:0; transform:translateX(-50%);
+                     font-size:9px; color:var(--dim); }
+  /* The bar is built from LED segments: unlit ones stay visible, just very
+     dim, and a whole LED lights up rather than a fraction of one. */
+  /* Mind the name: .leds already belongs to the status indicator row at the
+     top. Bar segments get their own .seg class - otherwise the indicators
+     inherit position:absolute and fly across the page. */
+  .segwrap { position:absolute; top:0; bottom:0; left:0; right:0;
+              --pitch:7px; --lit:5px; }
+  .bar.rtl .segwrap { transform:scaleX(-1); }
+  .seg { position:absolute; inset:0; background:repeating-linear-gradient(
+           90deg, var(--c) 0 var(--lit), transparent var(--lit) var(--pitch)); }
+  .seg.off { opacity:.15; }
+  .seg.on  { clip-path:inset(0 100% 0 0); transition:clip-path .08s linear; }
+  .seg.pk  { clip-path:inset(0 100% 0 0); }
+  .seg.pk.dip { background:repeating-linear-gradient(
+                  90deg, var(--white) 0 var(--lit), transparent var(--lit) var(--pitch)); }
+
+  /* Labels sit to the right of their mark on the mirrored bar as well, so the
+     numbers of all four bars line up. Only the fill is mirrored. */
+  .bar .val { text-align:right; font-size:15px; font-weight:700; }
+  /* SWR carries the colour of the REV bar it is derived from, both up top and
+     in the row below the bars, so its origin is obvious. GAIN stays white - it
+     is a different quantity. */
+  .swrtop { color:var(--rev); font-weight:700; font-size:20px;
+            margin-left:6px; letter-spacing:.02em; }
+  .cell .v .swrval { color:var(--rev); }
+
+  /* --- status cells --------------------------------------------------- */
+  .status { display:grid; grid-template-columns:repeat(auto-fit,minmax(84px,1fr)); gap:1px;
+            background:var(--line); border:1px solid var(--line); border-radius:4px;
+            overflow:hidden; margin-top:10px; }
+  .cell { background:var(--panel2); padding:5px 7px; text-align:center; }
+  .cell .k { font-size:10px; color:var(--dim); letter-spacing:.06em; }
+  .cell .v { font-size:14px; font-weight:700; color:var(--white); }
+  .cell .v .dim  { color:#49535f; font-weight:400; }
+  .cell .v .u    { color:var(--dim); font-weight:400; }   /* jednotka meritka */
+  .cell .v .pick { color:var(--white); }
+  .cell .v.stale { color:var(--dim); }        /* posledni znamy, uz nemereny */
+  .cell .v.t-cool { color:var(--grey); }
+  .cell .v.t-warm { color:var(--green); }
+  .cell .v.t-hot  { color:var(--yellow); }
+  .cell .v.t-vhot { color:var(--sand); }
+  .cell .v.t-trip { color:var(--red); }
+
+  /* --- leds ----------------------------------------------------------- */
+  .leds { display:flex; flex-wrap:wrap; gap:5px; }
+  .led { padding:3px 9px; border-radius:3px; font-size:11px; font-weight:700;
+         background:#171b22; color:#4a5666; border:1px solid var(--line); letter-spacing:.06em; }
+  .led.on { color:#0c0f14; }
+  .led.on.g { background:var(--green); } .led.on.y { background:var(--yellow); }
+  .led.on.r { background:var(--red); }   .led.on.c { background:var(--cyan); }
+
+  /* --- collapsible sections -------------------------------------------- */
+  details.panel { padding:0; }
+  details.panel > summary {
+    padding:9px 10px; cursor:pointer; font-size:12px; font-weight:600;
+    letter-spacing:.12em; text-transform:uppercase; color:var(--dim);
+    list-style:none; display:flex; align-items:center; gap:8px;
+  }
+  details.panel > summary::-webkit-details-marker { display:none; }
+  details.panel > summary::before { content:"\25B8"; font-size:11px; }
+  details.panel[open] > summary::before { content:"\25BE"; }
+  details.panel > summary:hover { color:var(--fg); }
+  details.panel > .body { padding:0 10px 10px; }
+
+  /* --- keypad ---------------------------------------------------------- */
+  .keys { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:10px; }
+  .keycol { display:grid; gap:5px; align-content:start; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:5px; }
+
+  /* --- setup tree -------------------------------------------------------- */
+  .navrow { display:flex; gap:6px; margin-bottom:9px; }
+  .navrow button { flex:1; }
+  .hint { color:var(--dim); font-size:11px; margin-bottom:8px; }
+  .tree { font-size:12px; line-height:1.7; }
+  .navbar { display:flex; gap:8px; align-items:center; margin-bottom:8px; }
+  .navstat { color:var(--cyan); font-size:11px; }
+  .tnode { display:flex; align-items:center; gap:8px; }
+  .tname { background:none; border:0; padding:3px 4px; color:var(--dim);
+           font:inherit; font-weight:700; text-align:left; letter-spacing:0;
+           cursor:pointer; }
+  .tname:hover:not(:disabled) { color:var(--fg); background:#2b3444; }
+  .tname:disabled { cursor:not-allowed; }
+  .tnode.live .tname { color:var(--cyan); }
+  .branch { color:var(--dim); font-size:11px; }
+  .leaf { display:flex; align-items:center; gap:8px; padding:2px 0 2px 22px; }
+  .leaf.on { background:#212a36; border-radius:3px; }
+  .leaf .ro { color:var(--white); font-size:12px; white-space:pre; }
+  button.tiny { padding:3px 9px; font-size:11px; }
+  .tree select {
+    font:inherit; font-size:12px; background:var(--panel2); color:var(--fg);
+    border:1px solid var(--line); border-radius:4px; padding:4px 6px;
+  }
+
+/* --- diagnostics --------------------------------------------------------- */
+  .probe { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-top:8px; }
+  .probe select { font:inherit; font-size:12px; background:var(--panel2);
+                  color:var(--fg); border:1px solid var(--line);
+                  border-radius:4px; padding:4px 6px; }
+  .dbg { font-size:11px; color:var(--dim); max-height:150px; overflow:auto;
+         background:#0c0f14; border:1px solid var(--line); border-radius:4px; padding:7px;
+         white-space:pre-wrap; word-break:break-all; margin-top:8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="panel top">
+    <span class="dot" id="dot" title="link status"></span>
+    <button id="btnPower" class="st-off">OFF</button>
+    <button id="btnOperate" class="st-off">STANDBY</button>
+    <button id="btnMode" class="st-off">PWR-L</button>
+    <button id="btnTune" class="st-off">TUNE</button>
+    <span id="swrTop" class="swrtop"></span>
+    <div class="leds" id="leds"></div>
+  </div>
+
+  <div id="warnBox" class="warn" hidden></div>
+
+  <div class="panel">
+    <div class="bars" id="bars"></div>
+    <div class="status" id="statusRow"></div>
+  </div>
+
+  <details class="panel" id="secKeys">
+    <summary>Keypad</summary>
+    <div class="body">
+      <div class="keys">
+        <div class="keycol" id="colL"></div>
+        <div class="keycol" id="colC"></div>
+        <div class="keycol" id="colR"></div>
+      </div>
+    </div>
+  </details>
+
+  <details class="panel" id="secSetup">
+    <summary>Setup</summary>
+    <div class="body">
+      <div class="navrow">
+        <button data-act="k:45">&larr;</button>
+        <button data-act="k:47" class="acc">SET</button>
+        <button data-act="k:46">&rarr;</button>
+      </div>
+      <div class="hint">
+        SET enters a menu and confirms, the arrows move the selection.
+        The tree mirrors the amplifier &mdash; the highlight follows the front panel.
+      </div>
+      <div class="tree" id="tree"></div>
+    </div>
+  </details>
+
+  <details class="panel" id="secDiag">
+    <summary>Diagnostics</summary>
+    <div class="body">
+      <div class="status" id="diag" style="margin-top:0"></div>
+      <div class="probe">
+        <select id="probeKey"></select>
+        <button class="tiny" id="probeTap">Tap</button>
+        <button class="tiny" id="probeHold">Hold 1.5 s</button>
+        <span class="hint" id="probeOut" style="margin:0"></span>
+      </div>
+      <div class="hint" id="unknown" style="margin:8px 0 0"></div>
+      <div class="dbg" id="dbg"></div>
+      <div style="margin-top:8px"><button id="btnClear">Clear log</button></div>
+    </div>
+  </details>
+
+</div>
+
+<script>
+"use strict";
+
+/* ====================================================================== *
+ *  1K-FA constants - other EXPERT models only change this block
+ * ====================================================================== */
+const AMP = {
+  paMaxFull: 1200.0,      // W pep
+  paMaxHalf:  600.0,
+  driveMax:   100.0,      // exciter range used in STANDBY
+  prMax:      200.0,      // W
+  vaMax:       60.0,      // V
+  iaMax:       50.0,      // A
+  tempMax:     90,        // C, nad tim zasahne hardwarova ochrana
+  /* Body sepnuti tri rychlosti ventilatoru, manual 18.17 CONTEST Settings.
+     V rezimu CONTEST bezi prvni stupen trvale a zbyle dva spinaji driv. */
+  fanOn:        { normal:[40, 65, 75], contest:[0, 60, 70] },
+  bands: ["160m","80m","40m","30m","20m","17m","15m","12m","10m","6m"],
+  cats:  ["SPE","ICOM","KENWOOD","YAESU","RS-232","NONE"],
+  ants:  ["1", "2", "3", "4"],   // kod 4 znamena "zadna antena", viz antName
+  // C_OUT bit weights in pF (manual p. 21)
+  coutBits: [3.6,6.4,12.1,18.9,40.8,81.5,158.0,321.5,641.6,1250.0],
+};
+
+/* The protocol encodes antennas 0-3, with 4 meaning "no antenna". The status
+   row lists only the four real ones and simply highlights none when the code is
+   4; where the value has to be named, "off" is used instead. */
+const antName = i => AMP.ants[i] ?? (i === 4 ? "off" : "?");
+
+const SYN_PA = 0xAA, SYN_PC = 0x55;
+const KEY_ON = 0x10, RCU_ON = 0x80, RCU_OFF = 0x81, STATUS_CODE = 0x80;
+
+/* Key codes. Note: the PDF (p. 7) lists 0x33 as "L+", same as 0x31 -
+   by the keyboard layout and the screenshot it is really C+. */
+const KEY = {
+  L_DN:0x30, L_UP:0x31, C_DN:0x32, C_UP:0x33, TUNE:0x34,
+  IN:0x28, BAND_DN:0x29, BAND_UP:0x2A, ANT:0x2B, CAT:0x2C,
+  LEFT:0x2D, RIGHT:0x2E, SET:0x2F,
+  OFF:0x18, MODE:0x1A, DISPLAY:0x1B, OPERATE:0x1C,
+};
+
+/* ====================================================================== *
+ *  Protocol revisions
+ *
+ *  Rev 1.0 (firmware 06_11_06_x)  - STATUS_CODE 0x80
+ *  Rev 2.0 (firmware >= 07_07_07_M, "CE/FCC Compliant Second Series")
+ *                                 - STATUS_CODE 0xA0 / 0xA1
+ *
+ *  Rev 2.0 shifted the whole DISPLAY_CTX map by one from 0x05 up, added
+ *  TEN-TEC and FLEX-RADIO to the CAT list, turned FLAGS bit 7 from PA_PROT
+ *  into T_SCALE, and gave SET ANTENNA two antennas per band. The status code
+ *  tells the revisions apart, so both are supported side by side.
+ * ====================================================================== */
+
+const WARN_COMMON = {
+  0x17:"Internal temperature above 90 °C (194 °F)",
+  0x1B:"Reverse power above 300 W pep",
+  0x1C:"Power amplifier protection tripped",
+};
+
+const PROTO = {
+  1: {
+    name:"Rev 1.0",
+    cats:["SPE","ICOM","KENWOOD","YAESU","RS-232","NONE"],
+    ctx:{
+      0x00:"LOGO (standby)", 0x01:"PA_OUT + I_PA", 0x02:"PW_REV + V_PA",
+      0x03:"CAT info", 0x04:"(debug)", 0x05:"Antennas vs bands",
+      0x06:"DATA STORED", 0x07:"SETUP OPTIONS", 0x08:"SET ANTENNA",
+      0x09:"SET CAT", 0x0A:"SET YAESU", 0x0B:"SET ICOM", 0x0C:"SET BAUDRATE",
+      0x0D:"MANUAL TUNE", 0x0E:"BACKLIGHT", 0x1D:"ALARM HISTORY",
+      0x1E:"SHUTDOWN", 0x1F:"WAIT",
+    },
+    warn:Object.assign({}, WARN_COMMON, {
+      0x0F:"Supply voltage below 26 V when entering OPERATE (HALF)",
+      0x10:"Supply voltage below 40 V when entering OPERATE (FULL)",
+      0x11:"Supply voltage dropped below 20 V (HALF)",
+      0x12:"Supply voltage dropped below 26 V (FULL)",
+      0x13:"Supply voltage rose above 38 V (HALF)",
+      0x14:"Supply voltage rose above 50 V (FULL)",
+      0x15:"Supply current above 40 A (HALF)",
+      0x16:"Supply current above 50 A (FULL)",
+      0x18:"Drive power from the transceiver above 50 W pep",
+      0x19:"Transmit on 12 m not allowed (US version)",
+      0x1A:"Transmit on 10 m not allowed (US version)",
+    }),
+    menu:{
+      0x07:["ANTENNA","CAT","MANUAL TUNE","BACKLIGHT","CONTEST","BEEP","QUIT"],
+      0x08:["160 m","80 m","40 m","30 m","20 m","17 m","15 m","12 m","10 m","6 m","SAVE"],
+      0x09:["SPE","ICOM","KENWOOD","YAESU","RS-232","NONE"],
+      0x0A:["FT 100","FT 757 GX2","FT 817","FT 840","FT 847","FT 890","FT 897",
+            "FT 900","FT 920","FT 990","FT 1000","FT 1000 MP1","FT 1000 MP2",
+            "FT 1000 MP3","BAND_DATA BCD"],
+      0x0B:["CI-V","VOLTAGE_BAND"],
+      0x0C:["1200 Bd","2400 Bd","4800 Bd","9600 Bd"],
+    },
+    tree:[
+      { ctx:0x07, name:"SETUP OPTIONS", depth:0, root:true },
+      { ctx:0x08, name:"SET ANTENNA",   depth:1, parent:0x07, pItem:0 },
+      { ctx:0x09, name:"SET CAT",       depth:1, parent:0x07, pItem:1 },
+      { ctx:0x0A, name:"SET YAESU",     depth:2, parent:0x09, pItem:3 },
+      { ctx:0x0B, name:"SET ICOM",      depth:2, parent:0x09, pItem:1 },
+      { ctx:0x0C, name:"SET BAUDRATE",  depth:2, parent:0x09 },
+      { ctx:0x0D, name:"MANUAL TUNE",   depth:1, parent:0x07, pItem:2, special:"tune" },
+      { ctx:0x0E, name:"BACKLIGHT",     depth:1, parent:0x07, pItem:3, special:"backlight" },
+    ],
+    antVsBand: 0x05,                       // dropped in Rev 2.0
+  },
+
+  2: {
+    name:"Rev 2.0",
+    cats:["SPE","ICOM","KENWOOD","YAESU","TEN-TEC","FLEX-RADIO","RS-232","NONE"],
+    ctx:{
+      0x00:"LOGO (standby)", 0x01:"PA_OUT + I_PA", 0x02:"PW_REV + V_PA",
+      0x03:"CAT info", 0x04:"(debug)", 0x05:"DATA STORED!",
+      0x06:"SETUP OPTIONS", 0x07:"SET ANTENNA", 0x08:"SET CAT",
+      0x09:"SET YAESU", 0x0A:"SET ICOM", 0x0B:"SET TEN-TEC",
+      0x0C:"SET BAUDRATE", 0x0D:"MANUAL TUNE", 0x0E:"BACKLIGHT",
+      0x0F:"(debug)", 0x10:"(debug)", 0x19:"(debug)", 0x1A:"(debug)",
+      0x1D:"ALARM HISTORY", 0x1E:"SHUTDOWN",
+    },
+    warn:Object.assign({}, WARN_COMMON, {
+      0x11:"Supply voltage dropped below 20 Vdc (HALF)",
+      0x12:"Supply voltage dropped below 26 Vdc (FULL)",
+      0x13:"Supply voltage rose above 50 Vdc (HALF)",
+      0x14:"Supply voltage rose above 50 Vdc (FULL)",
+      0x15:"Supply current above 40 A (HALF)",
+      0x16:"Supply current above 50 A (FULL)",
+      0x18:"Drive power from the transceiver above its maximum",
+    }),
+    menu:{
+      0x06:["ANTENNA","CAT","MANUAL TUNE","BACKLIGHT","CONTEST","BEEP",
+            "START","TEMP.","QUIT"],
+      0x08:["SPE","ICOM","KENWOOD","YAESU","TEN-TEC","FLEX-RADIO","RS-232","NONE"],
+      0x09:["FT 100","FT 757 GX2","FT 817/847","FT 840/890","FT 897","FT 900",
+            "FT 920","FT 900","FT 1000","FT 1000 MP1","FT 1000 MP2",
+            "FT 1000 MP3","FT 2000","FT 9000 D","BAND_DATA BCD"],
+      0x0A:["CI-V","VOLTAGE_BAND"],
+      0x0B:["OMNI VII","ORION I/II","JUPITER","ARGONAUT"],
+      0x0C:["1200 Bd","2400 Bd","4800 Bd","9600 Bd"],
+    },
+    tree:[
+      { ctx:0x06, name:"SETUP OPTIONS", depth:0, root:true },
+      { ctx:0x07, name:"SET ANTENNA",   depth:1, parent:0x06, pItem:0, special:"antenna" },
+      { ctx:0x08, name:"SET CAT",       depth:1, parent:0x06, pItem:1 },
+      { ctx:0x09, name:"SET YAESU",     depth:2, parent:0x08, pItem:3 },
+      { ctx:0x0A, name:"SET ICOM",      depth:2, parent:0x08, pItem:1 },
+      { ctx:0x0B, name:"SET TEN-TEC",   depth:2, parent:0x08, pItem:4 },
+      // the route into SET BAUDRATE is not documented - manual keys only
+      { ctx:0x0C, name:"SET BAUDRATE",  depth:2, parent:0x08 },
+      { ctx:0x0D, name:"MANUAL TUNE",   depth:1, parent:0x06, pItem:2, special:"tune" },
+      { ctx:0x0E, name:"BACKLIGHT",     depth:1, parent:0x06, pItem:3, special:"backlight" },
+    ],
+    // SET ANTENNA is indexed by SETUP_0 here, every other menu by SETUP_1
+    itemByte: ctx => (ctx === 0x07 ? 0 : 1),
+  },
+};
+PROTO[1].itemByte = () => 1;
+
+/* ====================================================================== *
+ *  Framer
+ *
+ *  The payload may contain 0xAA, so scanning for the marker is not enough -
+ *  the checksum decides. On mismatch we advance by a single byte.
+ * ====================================================================== */
+class Framer {
+  /* Longest frame is STATUS with CNT=30; ACK/NAK/UNK carry CNT=1. Anything
+     larger means a false marker, not missing data - without this bound two
+     stray 0xAA bytes would be read as CNT=0xAA=170 and the framer would wait
+     forever for 175 bytes that never arrive. */
+  static MAX_CNT = 64;
+  static MAX_BUF = 4096;
+
+  constructor(onFrame) {
+    this.buf = new Uint8Array(0);
+    this.onFrame = onFrame;
+    this.stats = { ok:0, bad:0, resync:0 };
+  }
+  push(chunk) {
+    const b = new Uint8Array(this.buf.length + chunk.length);
+    b.set(this.buf); b.set(chunk, this.buf.length);
+    this.buf = b;
+    this.parse();
+  }
+  parse() {
+    let i = 0;
+    const b = this.buf;
+    while (i + 5 <= b.length) {
+      if (!(b[i] === SYN_PA && b[i+1] === SYN_PA && b[i+2] === SYN_PA)) { i++; continue; }
+      const cnt = b[i+3];
+      if (cnt > Framer.MAX_CNT) {                   // false marker
+        this.stats.resync++; i++; continue;
+      }
+      const total = 4 + cnt + 1;
+      if (i + total > b.length) break;             // rest arrives later
+      let sum = 0;
+      for (let k = i+4; k < i+4+cnt; k++) sum = (sum + b[k]) & 0xFF;
+      if (sum === b[i+4+cnt]) {
+        this.stats.ok++;
+        this.onFrame(b.subarray(i+4, i+4+cnt));
+        i += total;
+      } else {
+        this.stats.bad++; this.stats.resync++;
+        i++;                                        // resync one byte
+      }
+    }
+    let rest = b.subarray(i);
+    if (rest.length > Framer.MAX_BUF) rest = rest.subarray(rest.length - 128);
+    this.buf = rest;
+  }
+}
+
+/* ====================================================================== *
+ *  STATUS decoder
+ *
+ *  payload[0] is offset [04] in the manual, i.e. STATUS_CODE.
+ *  All 16-bit words are little-endian (Low_Byte/High_Byte).
+ * ====================================================================== */
+function decode(p) {
+  if (p.length === 1) {
+    return { kind: {0x06:"ACK", 0x15:"NAK", 0xFF:"UNK"}[p[0]] || "?", short:true };
+  }
+  /* The status code identifies the protocol revision:
+       0x80         - Rev 1.0  (firmware 06_11_06_x)
+       0xA0 / 0xA1  - Rev 2.0  (firmware >= 07_07_07_M), bit 0 = startup mode
+     Anything else, or a frame shorter than the documented record, is reported
+     with its bytes so it can be identified. */
+  const rev = p[0] === 0x80 ? 1 : (p[0] & 0xFE) === 0xA0 ? 2 : 0;
+  if (p.length < 30 || !rev) {
+    return { kind:"?", short:true, len:p.length,
+             hex:[...p].map(b => b.toString(16).padStart(2,"0")).join(" ") };
+  }
+
+  const u16 = i => p[i] | (p[i+1] << 8);
+  const f = p[1];
+
+  const s = {
+    kind:"STATUS", short:false,
+    rev, proto: PROTO[rev],
+    code: p[0], len: p.length, extra: p.length - 30,
+    // Rev 2.0 starts in the mode this bit records; Rev 1.0 has no such bit
+    startup: rev === 2 ? (p[0] & 1 ? "OPERATE" : "STANDBY") : null,
+    flags:{
+      beep:    !!(f & 0x40), contest: !!(f & 0x20),
+      full:    !!(f & 0x10), alarm:   !!(f & 0x08), tx: !!(f & 0x04),
+      operate: !!(f & 0x02), tune:    !!(f & 0x01),
+      // FLAGS bit 7 changed meaning between revisions
+      paProt:  rev === 1 && !!(f & 0x80),
+      celsius: rev === 2 ? !!(f & 0x80) : true,
+    },
+    ctx: p[2],
+    setup: Array.from(p.subarray(3, 14)),          // SETUP_0..10
+    band:  p[14] >> 4,
+    input: p[14] & 0x0F,
+    subBand: p[15] & 0x7F,
+    freq:  u16(16),                                 // kHz
+    cat:   p[18] >> 4,
+    catName: PROTO[rev].cats[p[18] >> 4] ?? "?",
+    ant:   p[18] & 0x0F,
+    temp:  p[21],
+    paOut: u16(22) / 10,                            // W
+    pr:    u16(24) / 10,                            // W
+    va:    u16(26) / 10,                            // V
+    ia:    u16(28) / 10,                            // A
+  };
+
+  // Bytes 23-24 carry two different meanings, selected by FLAGS bit 1
+  const raw = u16(19);
+  if (s.flags.operate) {
+    s.gain = raw / 10;
+    s.gainTxt = raw === 99 ? "< 10.0 dB" : raw === 201 ? "> 20.0 dB"
+                                         : s.gain.toFixed(1) + " dB";
+    s.swr = null;
+  } else {
+    s.gain = null;
+    s.swr = raw / 100;
+    s.swrTxt = raw === 0 ? "—" : raw === 9999 ? "∞" : s.swr.toFixed(2);
+  }
+  return s;
+}
+
+/* C_OUT from the 10-bit word, by per-bit weights */
+function decodeCout(word) {
+  let pf = 0;
+  for (let i = 0; i < 10; i++) if (word & (1 << i)) pf += AMP.coutBits[i];
+  return pf;
+}
+
+/* ====================================================================== *
+ *  Sending commands
+ * ====================================================================== */
+function buildFrame(...data) {
+  const sum = data.reduce((a, b) => (a + b) & 0xFF, 0);
+  return [SYN_PC, SYN_PC, SYN_PC, data.length, ...data, sum];
+}
+const toHex = a => a.map(b => b.toString(16).padStart(2, "0")).join("");
+
+async function post(path, body) {
+  try {
+    const r = await fetch(path, {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify(body),
+    });
+    return await r.json();
+  } catch (e) { dbg("! POST " + path + " failed: " + e.message); return null; }
+}
+const sendKey = code => post("/key", { code });
+const sendRaw = bytes => post("/raw", { hex: toHex(bytes) });
+const sendRcuOn = () => sendRaw(buildFrame(RCU_ON));
+
+/* Power.
+   On the 1K-FA, DTR is a level switch rather than an ignition edge: high =
+   running, low = off. Measured - a 1000 ms pulse turned nothing on, while a
+   held DTR booted the PA in 6.7 s. "pulse" mode stays for other hardware. */
+let dtrMode = "level", dtrOn = false;
+
+async function setPower(on) {
+  if (dtrMode === "pulse") {
+    if (on) { await post("/power", { dtr_pulse:true }); dbg("> DTR pulse"); }
+    else    { await sendKey(KEY.OFF);                   dbg("> KEY OFF"); }
+    return;
+  }
+  const r = await post("/power", { dtr: on });
+  if (r && "dtr" in r) { dtrOn = r.dtr; renderPower(); }
+  dbg(on ? "> DTR HIGH (power on)" : "> DTR LOW (power off)");
+}
+
+/* ====================================================================== *
+ *  Rendering
+ * ====================================================================== */
+let last = null, lastRx = 0, connected = false, rxBytes = 0;
+let txSince = 0;                     // when TX without drive power started
+const TX_LOCK_AFTER = 2000;          // delsi nez zpozdeni sekvenceru
+
+const el = id => document.getElementById(id);
+const dbgLines = [];
+function dbg(line) {
+  dbgLines.push(line);
+  if (dbgLines.length > 120) dbgLines.shift();
+  const d = el("dbg");
+  d.textContent = dbgLines.join("\n");
+  d.scrollTop = 1e6;
+}
+
+/* --- bars ------------------------------------------------------------- */
+const BARS = [
+  { id:"fw",  label:"FW",  unit:"W", color:"var(--fw)"     },
+  { id:"rev", label:"REV", unit:"W", color:"var(--rev)", rtl:true },
+  // For voltage the sag under load matters, not the open-circuit maximum
+  { id:"v",   label:"V",   unit:"V", color:"var(--grey)", dip:true },
+  { id:"i",   label:"I",   unit:"A", color:"var(--grey)"   },
+];
+
+function buildBars() {
+  el("bars").innerHTML = BARS.map(b => `
+    <div class="bar${b.rtl ? " rtl" : ""}">
+      <div class="lbl">${b.label}</div>
+      <div class="track" id="track_${b.id}">
+        <div class="segwrap" id="wrap_${b.id}" style="--c:${b.color}">
+          <div class="seg off"></div>
+          <div class="seg on" id="on_${b.id}"></div>
+          <div class="seg pk" id="pk_${b.id}"></div>
+        </div>
+      </div>
+      <div class="val" id="val_${b.id}" style="color:${b.color}">—</div>
+      <div class="scale" id="ticks_${b.id}"></div>
+    </div>`).join("");
+}
+
+/* LEDs keep a fixed size, so a narrower page shows fewer of them rather than
+   smaller ones - the way a real bar indicator behaves.
+
+   The pitch is deliberately a WHOLE number of pixels. Computing it as
+   width/count produced fractional pixels, and the browser rounded every LED
+   boundary differently, so the gaps came out visibly uneven. Whatever is left
+   over past the last LED is split evenly between both ends, keeping the bar
+   centred. */
+const SEG_LIT = 5, SEG_GAP = 2;      // px, LED and gap
+const SEG_PITCH = SEG_LIT + SEG_GAP;
+const SEG_MIN = 10;                  // below this, dividing the bar is pointless
+const SEG_FALLBACK = 40;             // when the width cannot be measured
+const segCount = {};
+
+function measureSegments() {
+  for (const b of BARS) {
+    const tr = el("track_" + b.id);
+    const w = (tr && tr.clientWidth) || 0;
+    const n = w ? Math.max(SEG_MIN, Math.floor(w / SEG_PITCH)) : SEG_FALLBACK;
+    segCount[b.id] = n;
+    if (!w) continue;
+    const used = n * SEG_PITCH;
+    const pad = Math.max(0, (w - used) / 2);
+    const wrap = el("wrap_" + b.id);
+    wrap.style.setProperty("--pitch", SEG_PITCH + "px");
+    wrap.style.setProperty("--lit", SEG_LIT + "px");
+    wrap.style.left = pad + "px";
+    wrap.style.right = pad + "px";
+    // The scale has to match the LED strip's edges, or the numbers drift by pad
+    const sc = el("ticks_" + b.id);
+    sc.style.marginLeft = pad + "px";
+    sc.style.marginRight = pad + "px";
+  }
+}
+
+/* Peak detector: holds the extreme for PEAK_HOLD, then lets it fall back. On
+   SSB the mean is low, and without this the peak power would never show. */
+const PEAK_HOLD = 2400, PEAK_FALL = 0.6;      // fraction of full scale per second
+/* The number beside the bar shows the peak, not the instantaneous value - at
+   six packets a second the latter is unreadable, and the bar already carries
+   it. A new extreme is written straight away; the fall back is redrawn only
+   now and then, so the digits do not jitter. */
+const TEXT_PERIOD = 400;
+const peaks = {};
+let swrHold = { v: null, at: 0 };
+
+/* Holds the extreme and, once PEAK_HOLD has elapsed, lets it travel back to
+   the current reading. For power and current that extreme is the maximum; for
+   supply voltage it is the minimum, because the interesting figure there is the
+   sag under load - the maximum would only ever show the open-circuit reading. */
+function updatePeak(id, value, max, dip) {
+  const now = Date.now();
+  let p = peaks[id];
+  // A range change (FULL/HALF, OPERATE/STANDBY) makes the old extreme worthless
+  if (!p || p.max !== max || p.dip !== dip)
+    p = peaks[id] = { v: value, at: now, seen: now, max, dip };
+  // A negative step (system clock adjustment) would throw the extreme off scale
+  const dt = Math.max(0, (now - p.seen) / 1000);
+  p.seen = now;
+  const held = now - p.at > PEAK_HOLD;
+  if (dip) {
+    if (value <= p.v) { p.v = value; p.at = now; }
+    else if (held) p.v = Math.min(value, p.v + max * PEAK_FALL * dt);
+  } else {
+    if (value >= p.v) { p.v = value; p.at = now; }
+    else if (held) p.v = Math.max(value, p.v - max * PEAK_FALL * dt);
+  }
+  return p.v;
+}
+
+function setBar(id, value, max, unit, rtl, dip) {
+  const known = value !== null && value !== undefined;
+  const frac = known && max > 0 ? Math.max(0, Math.min(1, value / max)) : 0;
+
+  const N = segCount[id] || SEG_FALLBACK;
+
+  // A whole LED lights up, never a fraction of one
+  const lit = Math.round(frac * N);
+  const on = el("on_" + id);
+  on.style.clipPath = `inset(0 ${100 - lit * 100 / N}% 0 0)`;
+  on.dataset.lit = lit;
+
+  const pk = el("pk_" + id);
+  const peak = known ? updatePeak(id, value, max, dip) : 0;
+  // A reading can overshoot full scale (e.g. when switching FULL/HALF), so the
+  // peak LED index is clamped to the bar's range.
+  const pi = Math.min(N, Math.round(peak / max * N)) - 1;
+  // A peak sits above the lit part, a dip inside it - so the dip marker is
+  // drawn bright, showing up as a notch against the illuminated bar.
+  pk.classList.toggle("dip", !!dip);
+  if (pi > 0 && (dip ? pi < lit : pi >= lit)) {
+    pk.style.clipPath =
+      `inset(0 ${100 - (pi + 1) * 100 / N}% 0 ${pi * 100 / N}%)`;
+    pk.dataset.peak = pi;
+  } else {
+    pk.style.clipPath = "inset(0 100% 0 0)";
+    pk.dataset.peak = "";
+  }
+
+  const vEl = el("val_" + id);
+  if (!known) {
+    vEl.textContent = "—";
+  } else {
+    const p = peaks[id], now = Date.now();
+    // A new extreme is written at once; the drift back is redrawn only now and then
+    const jumped = dip ? peak < p.shown : peak > p.shown;
+    if (p.shown === undefined || jumped || now - (p.textAt || 0) >= TEXT_PERIOD) {
+      p.shown = peak;
+      p.textAt = now;
+      vEl.textContent = Math.round(peak) + " " + unit;
+    }
+  }
+
+  /* Marks at the quarters. Zero is not drawn - centred it would spill past the
+     left edge, and it is obvious anyway. On the mirrored bar the value is
+     counted from the right edge, keeping every bar's numbers aligned. */
+  const ticks = el("ticks_" + id);
+  const marks = [.25, .5, .75].map(f => ({ f, v: max * (rtl ? 1 - f : f) }));
+  const sig = marks.map(m => m.v).join(",");
+  if (ticks.dataset.sig !== sig) {
+    ticks.dataset.sig = sig;
+    ticks.innerHTML = marks.map(m =>
+      `<span style="left:${m.f * 100}%">` +
+      `${m.v % 1 ? m.v.toFixed(1) : m.v.toFixed(0)}</span>`).join("");
+  }
+}
+
+/* Ranges follow MODE and OPERATE/STANDBY - otherwise the exciter drive would
+   be an invisible sliver on a 1200 W scale. */
+/* SWR from forward and reflected power:  r = sqrt(Pr/Pf),  SWR = (1+r)/(1-r).
+   In OPERATE the amplifier does not send SWR - bytes 23-24 carry gain there -
+   so it is calculated. Below a few watts the ratio is just noise, so nothing
+   is shown. */
+function swrFrom(pf, pr) {
+  if (!(pf > 5) || pr < 0 || pr >= pf) return null;
+  const r = Math.sqrt(pr / pf);
+  return (1 + r) / (1 - r);
+}
+
+function renderBars(s) {
+  if (!s) {
+    el("swrTop").textContent = "";
+    setBar("fw",  null, AMP.paMaxFull, "W");
+    setBar("rev", null, AMP.prMax, "W", true);
+    setBar("v",   null, AMP.vaMax, "V", false, true);
+    setBar("i",   null, AMP.iaMax, "A");
+    return;
+  }
+  const fwMax = s.flags.operate ? (s.flags.full ? AMP.paMaxFull : AMP.paMaxHalf)
+                                : AMP.driveMax;
+  setBar("fw",  s.paOut, fwMax, "W");
+  setBar("rev", s.pr, AMP.prMax, "W", true);
+  setBar("v",   s.va, AMP.vaMax, "V", false, true);   // napeti sleduje propad
+  setBar("i",   s.ia, AMP.iaMax, "A");
+
+  /* SWR stays on screen as long as the held values beside the bars - once PTT
+     is released there is still something to read, instead of the figure
+     vanishing straight away. */
+  const swr = s.flags.tx ? swrFrom(s.paOut, s.pr) : null;
+  const now = Date.now();
+  if (swr) swrHold = { v: swr, at: now };
+  // Rozhoduje stari posledniho VYPOCTU, ne to, jestli je zrovna TX. Jinak by
+  // keying without power would present a stale figure as the current one.
+  const age = now - swrHold.at;
+  const showSwr = swrHold.v && age >= 0 && age < PEAK_HOLD;
+  el("swrTop").textContent = showSwr ? "SWR " + swrHold.v.toFixed(1) : "";
+}
+
+/* --- status cells ------------------------------------------------------ */
+const cell = (k, v) =>
+  `<div class="cell"><div class="k">${k}</div><div class="v">${v}</div></div>`;
+
+/* Lists every option with the unselected ones dimmed, so the choice on offer
+   is visible too, not just what happens to be selected. */
+/* Cislo bile, jednotka seda - oko pak cte hodnotu, ne "m" a "dB". */
+const withUnit = (v, u) => `${v}<span class="u">${u}</span>`;
+
+const choices = (all, idx) => all
+  .map((t, i) => `<span class="${i === idx ? "pick" : "dim"}">${t}</span>`)
+  .join(" ");
+
+function renderStatus(s) {
+  const d = "—";
+  el("statusRow").innerHTML = s
+    ? cell("IN", choices(["1", "2"], s.input)) +
+      cell("BAND", withUnit((AMP.bands[s.band] ?? "?").replace(/m$/, ""), "m")) +
+      cell("ANT", choices(AMP.ants, s.ant)) +
+      cell("CAT", s.catName) +
+      cell("OUT", s.flags.full ? "FULL" : "HALF") +
+      (s.flags.operate
+         ? cell("GAIN", withUnit(s.gainTxt.replace(/ dB$/, ""), " dB"))
+         : cell("SWR", `<span class="swrval">${s.swrTxt}</span>`)) +
+      tempCell(s) +
+      freqCell(s)
+    : ["IN","BAND","ANT","CAT","OUT","GAIN","TEMP","FREQ"]
+        .map(k => cell(k, d)).join("");
+
+  const f = s ? s.flags : {};
+  // The setup range starts at 0x07 in Rev 1.0 but at 0x06 in Rev 2.0
+  const setupLo = s && s.rev === 2 ? 0x06 : 0x07;
+  const inSetup = !!s && s.ctx >= setupLo && s.ctx <= 0x0E;
+  const leds = [["ALARM", f.alarm, "r"]];
+  if (!s || s.rev === 1) leds.push(["PROT", f.paProt, "r"]);   // Rev 1.0 only
+  leds.push(["TUNE", f.tune, "y"], ["SET", inSetup, "c"], ["TX", f.tx, "r"]);
+  el("leds").innerHTML = leds
+    .map(([n, on, c]) => `<span class="led ${on ? "on " + c : ""}">${n}</span>`).join("");
+
+  const op = el("btnOperate");
+  op.textContent = s && f.operate ? "OPERATE" : "STANDBY";
+  op.className = s && f.operate ? "st-op" : "st-off";
+
+  const md = el("btnMode");
+  md.textContent = s && f.full ? "PWR-H" : "PWR-L";
+  md.className = s && f.full ? "st-hi" : "st-off";
+
+  renderPower();          // prichod paketu sam o sobe znamena, ze PA bezi
+
+  /* With TX asserted the amplifier locks everything that would move the RF
+     path - BAND / ANT / CAT / IN and SET all stop responding, so the setup
+     cannot be entered. Measured on the bench: FLAGS stuck at 0x84 (TX set)
+     with 0.0 W of drive, and only OPERATE / MODE / OFF / DISPLAY answered.
+
+     A sequencer keys PTT before the RF arrives and drops it after, so TX with
+     no power is normal for a fraction of a second on every over. Only a
+     condition that persists means something is really holding PTT. */
+  const w = s ? s.proto.warn[s.ctx] : null;
+  const now = Date.now();
+  if (!s || !s.flags.tx || s.paOut > 0) txSince = 0;
+  else if (!txSince) txSince = now;
+  const txLock = txSince && now - txSince > TX_LOCK_AFTER;
+  el("warnBox").hidden = !w && !txLock;
+  if (w) el("warnBox").textContent = "⚠  " + w;
+  else if (txLock) el("warnBox").innerHTML =
+    "⚠  <b>TX asserted with no drive power.</b> While the amplifier sees TX it " +
+    "locks BAND / ANT / CAT / IN and SET, so the setup cannot be opened. " +
+    "Check the PTT / TX input on the back — with no transceiver attached it " +
+    "may be floating active.";
+}
+
+/* Barva teploty podle bodu sepnuti ventilatoru (manual 18.17 CONTEST
+   Settings). V rezimu CONTEST spinaji druhy a treti stupen driv. */
+/* Frequency only arrives while the amplifier is measuring it - from the
+   transceiver on transmit, otherwise from CAT, and zero when neither applies.
+   Rather than a dash, the last VALID reading is held in grey; during a
+   measurement it turns white.
+
+   The amplifier covers 1.8 to 54 MHz, so anything below 1 MHz is start-up
+   garbage (99 kHz has been seen) and is not worth remembering. */
+const FREQ_MIN = 1000;               // kHz
+let lastFreq = 0;
+function freqCell(s) {
+  if (s.freq >= FREQ_MIN) lastFreq = s.freq;
+  const live = s.freq >= FREQ_MIN && s.flags.tx;
+  const txt = lastFreq ? (lastFreq / 1000).toFixed(3) : "—";
+  return `<div class="cell"><div class="k">FREQ</div>` +
+         `<div class="v${live ? "" : " stale"}">${txt}</div></div>`;
+}
+
+function tempCell(s) {
+  const c = s.flags.celsius ? s.temp : (s.temp - 32) * 5 / 9;
+  const [f1, f2, f3] = s.flags.contest ? AMP.fanOn.contest : AMP.fanOn.normal;
+  const cls = c >= AMP.tempMax ? "t-trip" : c >= f3 ? "t-vhot"
+            : c >= f2 ? "t-hot" : c >= f1 ? "t-warm" : "t-cool";
+  return `<div class="cell"><div class="k">TEMP</div>` +
+         `<div class="v ${cls}">${s.temp}${s.flags.celsius ? " °C" : " °F"}</div></div>`;
+}
+
+/* The amplifier can be running without us holding DTR - somebody may have
+   switched it on from the front panel before this application started. The only
+   reliable sign is that STATUS packets are arriving. */
+function ampLive() { return !!last && Date.now() - lastRx < 2500; }
+
+function renderPower() {
+  const b = el("btnPower");
+  const on = ampLive() || dtrOn;
+  b.textContent = on ? "ON" : "OFF";
+  b.className = on ? "st-on" : "st-off";
+}
+
+async function togglePower() {
+  if (!(ampLive() || dtrOn)) return setPower(true);
+  if (dtrOn) return setPower(false);          // drzime napajeni my
+  // Running, but we do not hold DTR - Rev. 2.0 p. 4: the OFF command is an
+  // equivalent way to shut it down
+  await sendKey(KEY.OFF);
+  dbg("> KEY OFF (bezi bez naseho DTR)");
+}
+
+/* --- keypad -------------------------------------------------------------- */
+function buildKeys() {
+  const mk = (label, cls, act) => `<button class="${cls}" data-act="${act}">${label}</button>`;
+
+  el("colL").innerHTML =
+    `<div class="grid2">
+       ${mk("&larr; L","","k:48")}${mk("L &rarr;","","k:49")}
+       ${mk("&larr; C","","k:50")}${mk("C &rarr;","","k:51")}
+     </div>`;                       // TUNE sedi v hornim radku
+
+  el("colC").innerHTML =
+    mk("IN","","k:40") +
+    `<div class="grid2">${mk("&larr; BAND","","k:41")}${mk("BAND &rarr;","","k:42")}</div>` +
+    `<div class="grid2">${mk("ANT","","k:43")}${mk("CAT","","k:44")}</div>` +
+    `<div class="grid2">${mk("&larr;","","k:45")}${mk("&rarr;","","k:46")}</div>` +
+    mk("SET","wide acc","k:47");
+
+  // ON/OFF, OPERATE a PWR-L/H sedi v hornim radku, tady uz nejsou
+  el("colR").innerHTML = mk("DISPLAY","wide","k:27");
+}
+
+/* Delegated - covers the keypad and the arrows in the Setup panel alike. */
+document.addEventListener("click", e => {
+  const b = e.target.closest("button[data-act]");
+  if (!b) return;
+  const code = parseInt(b.dataset.act.slice(2), 10);
+  sendKey(code);
+  dbg("> KEY 0x" + code.toString(16).padStart(2, "0"));
+});
+
+  /* --- setup tree ----------------------------------------------------------- *
+ *
+ *  The menu is a state machine inside the amplifier: there is no "set antenna
+ *  for 20 m" command, only SET / left / right. So clicking a node cannot jump
+ *  anywhere - it has to walk there.
+ *
+ *  The walker is closed-loop: it sends ONE key, waits for the next STATUS
+ *  packet to confirm the expected change, and only then sends the next one.
+ *  If the amplifier does not follow within a few tries it stops and says so,
+ *  rather than drumming blind keystrokes into a 1 kW amplifier.
+ * ------------------------------------------------------------------------- */
+
+const nav = {
+  steps: [],            // [{ key, done(s), tries }]
+  sentAt: 0,
+  status: "",
+  busy() { return this.steps.length > 0; },
+
+  start(steps, what) {
+    if (last && last.flags.tx) {
+      return this.stop("not while TX is asserted - the amplifier locks the keypad");
+    }
+    this.steps = steps;
+    this.sentAt = 0;
+    this.status = "→ " + what;
+    dbg("~ nav: " + what);
+    this.pump(last);
+  },
+
+  stop(msg) {
+    this.steps = [];
+    this.status = msg;
+    if (msg) dbg("~ nav: " + msg);
+    renderTree(last);
+  },
+
+  /* Called for every STATUS packet and right after a step is queued. */
+  pump(s) {
+    if (!this.steps.length || !s) return;
+    const step = this.steps[0];
+
+    if (step.done(s)) {                       // this step landed
+      this.steps.shift();
+      this.sentAt = 0;
+      if (!this.steps.length) return this.stop("");
+      return this.pump(s);                    // next step may already be done
+    }
+    // Wait for the amplifier to answer before repeating; RCU runs at 5-8/s.
+    if (Date.now() - this.sentAt < 400) return;
+    if ((step.tries = (step.tries || 0) + 1) > 12)
+      return this.stop("stopped: the amplifier did not follow");
+    this.sentAt = Date.now();
+    sendKey(step.key);
+  },
+};
+
+/* Build the key sequence that walks from wherever we are to a given menu. */
+function routeTo(P, ctx) {
+  const byCtx = c => P.tree.find(t => t.ctx === c);
+  const chain = [];
+  for (let n = byCtx(ctx); n && !n.root; n = byCtx(n.parent)) {
+    if (n.pItem === undefined) return null;   // undocumented route
+    chain.unshift(n);
+  }
+  const root = P.tree.find(t => t.root);
+  const steps = [];
+  // Enter the setup from the normal display
+  steps.push({ key: KEY.SET, done: s => s.ctx >= root.ctx && s.ctx <= 0x0E });
+  for (const n of chain) {
+    const count = (P.menu[n.parent] || []).length || 1;
+    steps.push(itemStep(P, n.parent, n.pItem, count));
+    steps.push({ key: KEY.SET, done: s => s.ctx === n.ctx });
+  }
+  return steps;
+}
+
+/* A step whose key depends on the current position (shortest way round). */
+function itemStep(P, ctx, want, count) {
+  return {
+    ctx, want, count,
+    get key() {
+      const s = last;
+      if (!s || s.ctx !== ctx) return KEY.RIGHT;
+      const at = s.setup[P.itemByte(ctx)];
+      const d = (want - at + count) % count;
+      return d <= count - d ? KEY.RIGHT : KEY.LEFT;
+    },
+    done: s => s.ctx === ctx && s.setup[P.itemByte(ctx)] === want,
+  };
+}
+
+function goToMenu(ctx) {
+  const P = last ? last.proto : PROTO[2];
+  const steps = routeTo(P, ctx);
+  if (!steps) return nav.stop("no documented route into this menu");
+  const name = (P.tree.find(t => t.ctx === ctx) || {}).name || "menu";
+  nav.start(steps, "open " + name);
+}
+
+function goToItem(ctx, want) {
+  const P = last ? last.proto : PROTO[2];
+  const count = ctx === 0x07 && P === PROTO[2]
+    ? AMP.bands.length + 1                    // Rev 2.0 SET ANTENNA: bands + SAVE
+    : (P.menu[ctx] || []).length || 1;
+  nav.start([itemStep(P, ctx, want, count)], "select item " + want);
+}
+
+function goToValue(ctx, want) {
+  const P = last ? last.proto : PROTO[2];
+  const count = (P.menu[ctx] || []).length || 1;
+  nav.start([itemStep(P, ctx, want, count),
+             { key: KEY.SET, done: s => s.ctx !== ctx }],
+            "set " + (P.menu[ctx] || [])[want]);
+}
+
+/* --- rendering ------------------------------------------------------------ */
+function renderTree(s) {
+  const P = s ? s.proto : PROTO[2];
+  const ctx = s ? s.ctx : -1;
+  const item = s ? s.setup[P.itemByte(ctx)] : -1;
+  const out = [];
+  const esc = t => String(t).replace(/[<>&]/g, c => ({ "<":"&lt;", ">":"&gt;", "&":"&amp;" }[c]));
+
+  out.push(`<div class="navbar">
+      <button class="tiny" data-nav="up">Leave menu (SET)</button>
+      <span class="navstat">${esc(nav.status || (s ? "" : "waiting for data"))}</span>
+    </div>`);
+
+  for (const n of P.tree) {
+    const live = ctx === n.ctx;
+    const pad = "  ".repeat(n.depth);
+    out.push(
+      `<div class="tnode ${live ? "live" : ""}">` +
+        `<button class="tname" data-goto="${n.ctx}" ${nav.busy() ? "disabled" : ""}>` +
+          `${pad}${live ? "▾" : "▸"} ${esc(n.name)}</button>` +
+        `<span class="branch">0x${n.ctx.toString(16).padStart(2, "0")}</span>` +
+      `</div>`);
+    if (!live) continue;
+
+    if (n.special === "antenna") {
+      /* Rev 2.0: two antennas per band, one byte each in SETUP_1..SETUP_10.
+         bit 7 DEF_ANT, bits 6-4 antenna #2, bits 2-0 antenna #1. */
+      AMP.bands.forEach((band, i) => {
+        const b = s.setup[1 + i] ?? 0;
+        const def = b & 0x80 ? 2 : 1;
+        out.push(`<div class="leaf ${i === item ? "on" : ""}">` +
+          `<button class="tiny" data-item="${n.ctx}:${i}">${band}</button>` +
+          `<span class="ro">${def === 1 ? "▸" : "&nbsp;"}${antName(b & 7)}` +
+          `&nbsp;&nbsp;${def === 2 ? "▸" : "&nbsp;"}${antName((b >> 4) & 7)}</span>` +
+          `</div>`);
+      });
+      out.push(`<div class="leaf ${item === 10 ? "on" : ""}">` +
+        `<button class="tiny" data-item="${n.ctx}:10">SAVE</button></div>`);
+
+    } else if (n.special === "tune") {
+      const l = s.setup[1] / 10;
+      const c = decodeCout(s.setup[2] | ((s.setup[3] & 0x03) << 8));
+      out.push(`<div class="leaf"><span class="ro">L_OUT ${l.toFixed(1)} µH</span>
+          <button class="tiny" data-key="${KEY.L_DN}">L −</button>
+          <button class="tiny" data-key="${KEY.L_UP}">L +</button></div>`);
+      out.push(`<div class="leaf"><span class="ro">C_OUT ${c.toFixed(1)} pF</span>
+          <button class="tiny" data-key="${KEY.C_DN}">C −</button>
+          <button class="tiny" data-key="${KEY.C_UP}">C +</button></div>`);
+
+    } else if (n.special === "backlight") {
+      const v = s.setup[1];
+      out.push(`<div class="leaf"><span class="ro">${v} / 255</span>
+          <button class="tiny" data-key="${KEY.LEFT}">−</button>
+          <button class="tiny" data-key="${KEY.RIGHT}">+</button></div>`);
+
+    } else {
+      /* Plain menu: the selection is the value, so a dropdown maps onto
+         "walk to that item, then press SET". */
+      const opts = P.menu[n.ctx] || [];
+      if (!opts.length) continue;
+      const sel = opts.map((label, i) =>
+        `<option value="${i}" ${i === item ? "selected" : ""}>${esc(label)}</option>`).join("");
+      out.push(`<div class="leaf on">
+          <select data-sel="${n.ctx}" ${nav.busy() ? "disabled" : ""}>${sel}</select>
+          <button class="tiny" data-apply="${n.ctx}" ${nav.busy() ? "disabled" : ""}>Apply (SET)</button>
+        </div>`);
+    }
+  }
+
+  if (s && s.rev === 1 && ctx === P.antVsBand) {
+    out.push(`<div class="tnode live"><span class="tname">ANTENNAS × BANDS</span>
+              <span class="branch">0x05</span></div>`);
+    const byBand = s.setup[0] === 0x01;
+    for (let i = 1; i <= 10; i++) {
+      const hi = s.setup[i] >> 4, lo = s.setup[i] & 0x0F;
+      const [b, a] = byBand ? [hi, lo] : [lo, hi];
+      out.push(`<div class="leaf"><span class="ro">${AMP.bands[b] ?? "?"} → ANT ${antName(a)}</span></div>`);
+    }
+  }
+  if (ctx === 0x1D) {
+    const n = s.setup[0] & 0x0F;
+    out.push(`<div class="tnode live"><span class="tname">ALARM HISTORY (${n})</span>
+              <span class="branch">0x1D</span></div>`);
+    for (let i = 1; i <= Math.min(10, n); i++) {
+      const inp = (s.setup[i] >> 7) + 1, code = s.setup[i] & 0x7F;
+      out.push(`<div class="leaf"><span class="ro">IN${inp}  ` +
+               `${esc(P.warn[code] || "code 0x" + code.toString(16))}</span></div>`);
+    }
+  }
+  if (ctx === 0x03) {
+    const bcd = b => (b >> 4).toString() + (b & 0x0F).toString();
+    const rel = bcd(s.setup[6]) + "_" + bcd(s.setup[7]) + "_" + bcd(s.setup[8]) +
+                "_" + String.fromCharCode(s.setup[9]);
+    const bauds = ["1200", "2400", "4800", "9600"];
+    out.push(`<div class="tnode live"><span class="tname">CAT INFO</span>
+              <span class="branch">0x03</span></div>`);
+    out.push(`<div class="leaf"><span class="ro">CAT 1: ${P.cats[s.setup[0]] ?? "?"} @ ${bauds[s.setup[2] & 3]} Bd</span></div>`);
+    out.push(`<div class="leaf"><span class="ro">CAT 2: ${P.cats[s.setup[3]] ?? "?"} @ ${bauds[s.setup[5] & 3]} Bd</span></div>`);
+    out.push(`<div class="leaf"><span class="ro">Firmware: ${esc(rel)}</span></div>`);
+  }
+
+  el("tree").innerHTML = out.join("");
+}
+
+/* Clicks inside the tree */
+document.addEventListener("click", e => {
+  const t = e.target.closest("[data-goto],[data-item],[data-apply],[data-key],[data-nav]");
+  if (!t) return;
+  if (nav.busy() && !t.dataset.nav) return;
+  if (t.dataset.nav === "up")    { nav.stop(""); sendKey(KEY.SET); dbg("> KEY SET"); }
+  else if (t.dataset.goto)       goToMenu(+t.dataset.goto);
+  else if (t.dataset.item)       { const [c, i] = t.dataset.item.split(":"); goToItem(+c, +i); }
+  else if (t.dataset.key)        { sendKey(+t.dataset.key); dbg("> KEY 0x" + (+t.dataset.key).toString(16)); }
+  else if (t.dataset.apply) {
+    const sel = document.querySelector(`select[data-sel="${t.dataset.apply}"]`);
+    if (sel) goToValue(+t.dataset.apply, +sel.value);
+  }
+});
+
+/* --- diagnostics ------------------------------------------------------------ */
+function renderDiag(framer) {
+  const st = framer.stats;
+  const age = last ? ((Date.now() - lastRx) / 1000).toFixed(1) + " s" : "—";
+  el("diag").innerHTML =
+    cell("RX bytes", rxBytes) +
+    cell("Frames OK", st.ok) +
+    cell("Bad CHK", st.bad) +
+    cell("Resync", st.resync) +
+    cell("Last", age) +
+    cell("Protocol", last ? last.proto.name : "—") +
+    cell("Status code", last ? "0x" + last.code.toString(16).padStart(2,"0") : "—") +
+    cell("Startup", last && last.startup ? last.startup : "—") +
+    cell("DISPLAY_CTX", last ? "0x" + last.ctx.toString(16).padStart(2,"0") : "—") +
+    cell("Context", last ? (last.proto.ctx[last.ctx] || last.proto.warn[last.ctx] || "?") : "—");
+  if (lastUnknown) el("unknown").textContent = "Undecoded frame:  " + lastUnknown;
+}
+
+/* ====================================================================== *
+ *  Link + RCU session
+ *
+ *  The amplifier always returns to RCU_OFF after power-up, so the only way
+ *  to (re)start the stream is to send RCU_ON whenever nothing has arrived
+ *  for a while - including right after pressing TURN ON.
+ * ====================================================================== */
+let lastUnknown = "";
+const framer = new Framer(payload => {
+  const s = decode(payload);
+  if (s.short) {
+    if (s.hex) {                       // valid checksum, unexpected shape
+      lastUnknown = `len=${s.len}  ${s.hex}`;
+      dbg("< ?? " + lastUnknown);
+    } else {
+      dbg("< " + s.kind);
+    }
+    return;
+  }
+  const prev = last;
+  last = s; lastRx = Date.now();
+  if (!prev || prev.ctx !== s.ctx) {
+    const name = s.proto.ctx[s.ctx] || s.proto.warn[s.ctx] || "?";
+    dbg(`< CTX 0x${s.ctx.toString(16).padStart(2,"0")}  ${name}`);
+  }
+  renderBars(s); renderStatus(s);
+  nav.pump(s);                       // advance the closed-loop walker
+  renderTree(s);
+});
+
+function setConn(ok) {
+  connected = ok;
+  el("dot").classList.toggle("ok", ok);
+  el("dot").title = ok ? "connected" : "disconnected";
+}
+
+function connect() {
+  const es = new EventSource("/stream");     // the browser reconnects on its own
+
+  es.addEventListener("hello", e => {
+    const h = JSON.parse(e.data);
+    if (h.dtr_mode) dtrMode = h.dtr_mode;
+    if ("dtr" in h) dtrOn = h.dtr;
+    renderPower();
+    setConn(true);
+    dbg("· " + h.source);
+    sendRcuOn();
+    dbg("> RCU_ON");
+  });
+
+  es.addEventListener("rx", e => {
+    const hex = e.data;
+    const b = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < b.length; i++) b[i] = parseInt(hex.substr(i * 2, 2), 16);
+    rxBytes += b.length;
+    framer.push(b);
+  });
+
+  // Bytes sent by someone else, e.g. the original app on the raw port
+  es.addEventListener("tx", e => { if (e.data.length <= 20) dbg("» " + e.data); });
+
+  es.onerror = () => setConn(false);
+  es.onopen  = () => setConn(true);
+}
+
+let tick = 0;
+setInterval(async () => {
+  renderDiag(framer);
+  renderPower();                     // power state also follows from the packets going quiet
+  if (!connected) return;
+  if (Date.now() - lastRx > 1500) { sendRcuOn(); dbg("> RCU_ON (watchdog)"); }
+  if (++tick % 5 === 0) {                       // re-check power state now and then
+    try {
+      const h = await (await fetch("/health")).json();
+      if ("dtr" in h && h.dtr !== dtrOn) { dtrOn = h.dtr; renderPower(); }
+    } catch (e) { /* offline, handled elsewhere */ }
+  }
+}, 1000);
+
+/* ---------------------------------------------------------------------- *
+ *  Key probe
+ *
+ *  Neither protocol revision documents how long a key has to be held, and an
+ *  ACK only confirms the code was valid - not that the amplifier acted on it.
+ *  So instead of guessing: snapshot the state, send the key, watch what moved.
+ * ---------------------------------------------------------------------- */
+const probe = { before: null, timer: 0 };
+
+function snapshot() {
+  if (!last) return null;
+  return { ctx:last.ctx, item:last.setup[last.proto.itemByte(last.ctx)],
+           band:last.band, ant:last.ant, cat:last.cat,
+           op:last.flags.operate, full:last.flags.full, tune:last.flags.tune };
+}
+
+function probeReport() {
+  const a = probe.before, b = snapshot();
+  const out = el("probeOut");
+  if (!a || !b) { out.textContent = "no data from the amplifier"; return; }
+  const diff = Object.keys(a).filter(k => a[k] !== b[k]);
+  if (!diff.length) {
+    out.textContent = `no change - still CTX 0x${b.ctx.toString(16).padStart(2,"0")}`;
+    out.style.color = "var(--red)";
+  } else {
+    out.textContent = "changed: " + diff.map(k => `${k} ${a[k]}→${b[k]}`).join(", ");
+    out.style.color = "var(--green)";
+  }
+}
+
+function runProbe(code, holdMs) {
+  probe.before = snapshot();
+  if (!probe.before) { el("probeOut").textContent = "no data from the amplifier"; return; }
+  clearTimeout(probe.timer);
+  el("probeOut").style.color = "var(--dim)";
+  el("probeOut").textContent = holdMs ? "holding…" : "sent, watching…";
+  dbg(`~ probe 0x${code.toString(16).padStart(2,"0")} ` +
+      `${holdMs ? "hold " + holdMs + " ms" : "tap"}` +
+      `  from CTX 0x${probe.before.ctx.toString(16).padStart(2,"0")}`);
+
+  sendKey(code);
+  if (holdMs) {
+    // 8 presses per second is the ceiling both revisions give for the link
+    const iv = setInterval(() => sendKey(code), 125);
+    setTimeout(() => clearInterval(iv), holdMs);
+  }
+  probe.timer = setTimeout(probeReport, (holdMs || 0) + 2500);
+}
+
+el("probeKey").innerHTML = Object.entries(KEY)
+  .map(([n, c]) => `<option value="${c}">${n}  (0x${c.toString(16)})</option>`).join("");
+el("probeKey").value = KEY.SET;
+el("probeTap").addEventListener("click", () => runProbe(+el("probeKey").value, 0));
+el("probeHold").addEventListener("click", () => runProbe(+el("probeKey").value, 1500));
+
+el("btnPower").addEventListener("click", togglePower);
+el("btnOperate").addEventListener("click", () => {
+  sendKey(KEY.OPERATE); dbg("> KEY OPERATE");
+});
+el("btnMode").addEventListener("click", () => {
+  sendKey(KEY.MODE); dbg("> KEY MODE (FULL/HALF)");
+});
+el("btnTune").addEventListener("click", () => {
+  sendKey(KEY.TUNE); dbg("> KEY TUNE");
+});
+el("btnClear").addEventListener("click", () => {
+  dbgLines.length = 0; el("dbg").textContent = "";
+});
+
+buildBars(); buildKeys();
+measureSegments();
+addEventListener("resize", () => { measureSegments(); renderBars(last); });
+renderBars(null); renderStatus(null); renderTree(null); renderDiag(framer);
+renderPower();
+connect();
+</script>
+</body>
+</html>

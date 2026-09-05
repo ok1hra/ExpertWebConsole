@@ -1,0 +1,20 @@
+# Generated during test runs (test/run.sh recreates them)
+test/pure.js
+test/fixture.log
+
+# Standalone bundle built with --bundle; an artifact, never a source
+*-standalone.py
+
+# Python
+__pycache__/
+*.pyc
+
+# Traffic captures from --record and from DEBUG=1 ./expert-console.sh
+*.cap
+expert1k*.log
+
+# Local tooling and editors
+.claude/settings.local.json
+*.swp
+*~
+.DS_Store
