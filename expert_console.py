@@ -2,13 +2,19 @@
 """
 EXPERT 1K-FA - web console (daemon + web server).
 
-The daemon owns the serial port, drives DTR and passes bytes through. Protocol
-knowledge lives in index.html - deliberately not here, apart from the OFF frame
-used by auto-shutdown.
+The daemon owns the serial port, drives DTR and passes bytes through. The full
+protocol - the setup tree, every DISPLAY_CTX, the bar graphs - lives in
+index.html and only there.
+
+The daemon decodes the little it needs to stand on its own: the RCU_ON
+watchdog, and the handful of STATUS fields TrxNet publishes. That duplication
+is deliberate and bounded; test/decode_test.py checks it against the same
+test/fixture.log the JavaScript decoder is tested with.
 
   ./expert_console.py --port /dev/ttyUSB.pa --raw-port 7373
   ./expert_console.py --simulate
   ./expert_console.py --replay /tmp/expert1k.log
+  ./expert_console.py --port /dev/ttyUSB.pa --trxnet --trxnet-subscribe
 
 The only dependency is pyserial, and only for --port:
   apt install python3-serial
@@ -19,6 +25,7 @@ import json
 import os
 import re
 import socket
+import struct
 import sys
 import threading
 import time
@@ -35,7 +42,13 @@ SYN_PA = 0xAA          # PA -> PC
 KEY_ON = 0x10
 RCU_ON = 0x80
 RCU_OFF = 0x81
+CAT_232 = 0x82         # remote tuning: 0x82 LO HI, frequency in kHz
 KEY_OFF = 0x18         # klavesa OFF - jednoznacny prikaz, ne prepinac
+
+# Keys the daemon presses on its own. The rest stay in index.html.
+KEY_MODE = 0x1A        # PWR-L / PWR-H  - a toggle, not a setter
+KEY_OPERATE = 0x1C     # STANDBY / OPERATE - a toggle, not a setter
+KEY_TUNE = 0x34        # momentary
 
 
 def frame(*data: int) -> bytes:
@@ -47,6 +60,7 @@ def frame(*data: int) -> bytes:
 
 
 FRAME_OFF = frame(KEY_ON, KEY_OFF)      # 55 55 55 02 10 18 28
+FRAME_RCU_ON = frame(RCU_ON)            # 55 55 55 01 80 80
 
 
 # --------------------------------------------------------------------------
@@ -77,7 +91,21 @@ class Hub:
         self._sent = deque(maxlen=self.MAX_CMD_PER_SEC)
         self._last_client_gone = None
         self._shutdown_fired = False
+        self._taps = []                 # in-process observers of the RX stream
+        self._last_rcu = 0.0            # last RCU_ON the watchdog sent
+        self.last_rx = 0.0              # time of the last byte from the PA
+        self.last_activity = None       # someone used the amplifier (see below)
         self.stats = {"rx_bytes": 0, "tx_bytes": 0, "dropped_cmds": 0}
+
+    def add_tap(self, cb):
+        """
+        Register an in-process observer of received bytes.
+
+        Unlike an SSE subscriber a tap is not a client: it does not keep
+        auto-shutdown at bay and does not appear in the client count. The
+        status decoder feeding TrxNet hangs off this.
+        """
+        self._taps.append(cb)
 
     # -- odber ------------------------------------------------------------
 
@@ -119,6 +147,7 @@ class Hub:
         overflows after RCU_ON, because the amplifier keeps streaming.
         """
         self.stats["rx_bytes"] += len(data)
+        self.last_rx = time.time()
         self._publish("rx", data)
         with self._raw_lock:
             raw = self._raw_client
@@ -127,6 +156,11 @@ class Hub:
                 raw.sendall(data)
             except OSError:
                 pass
+        for tap in self._taps:
+            try:
+                tap(data)
+            except Exception as e:                # a tap must never stop the flow
+                log(f"tap error: {e}")
 
     # -- smer klienti -> PA ----------------------------------------------
 
@@ -165,11 +199,45 @@ class Hub:
         with self._raw_lock:
             return self._raw_client is not None
 
+    # -- RCU session ------------------------------------------------------
+
+    RCU_QUIET_S = 1.5
+
+    def tick_rcu(self):
+        """
+        Restart the telemetry stream whenever it falls silent.
+
+        The amplifier resets RCU to OFF on power-up, so the only way to get
+        packets flowing - after a boot, after a glitch, at all - is to keep
+        asking. This used to live in the browser alone; the daemon needs its
+        own copy to be of any use with no page open. index.html keeps its
+        watchdog as a fallback, and at 1.5 s apart the two cost 1.3 frames per
+        second against a ceiling of 8.
+        """
+        now = time.time()
+        if now - self.last_rx < self.RCU_QUIET_S:
+            return
+        if now - self._last_rcu < self.RCU_QUIET_S:
+            return
+        self._last_rcu = now
+        self.send(FRAME_RCU_ON)
+
     # -- auto-shutdown ----------------------------------------------------
+
+    def note_activity(self):
+        """
+        Someone used the amplifier from outside the browser.
+
+        Presence deliberately does not count, only traffic: a TrxNet peer that
+        merely announces itself every 30 s has no business holding a kilowatt
+        up, while a transceiver sending its frequency plainly does.
+        """
+        self.last_activity = time.time()
+        self._shutdown_fired = False
 
     def tick_auto_shutdown(self):
         """
-        Powers the amplifier down after N minutes with no client connected.
+        Powers the amplifier down after N minutes with no client and no use.
 
         In level mode by dropping DTR, otherwise with the OFF command - which is
         unambiguous, unlike OPERATE which toggles, so the daemon needs no
@@ -182,7 +250,10 @@ class Hub:
             return
         if self._last_client_gone is None or self._shutdown_fired:
             return
-        idle = time.time() - self._last_client_gone
+        since = self._last_client_gone
+        if self.last_activity is not None:
+            since = max(since, self.last_activity)
+        idle = time.time() - since
         if idle >= self.auto_shutdown_min * 60:
             log(f"auto-shutdown: {self.auto_shutdown_min} min with no client")
             if self.dtr_mode == "level":
@@ -401,6 +472,8 @@ class SimulateSource:
         self.input = 0
         self.antenna = 0
         self.cat = 1                             # ICOM
+        self.cat_freq = None                     # set by CAT_232, kHz
+        self.cat_sub = None
         self.backlight = 200
         self.t0 = time.time()
         self._pending = deque()
@@ -482,12 +555,14 @@ class SimulateSource:
 
     def _status(self):
         m = self._measures()
-        freq = self.BAND_FREQ[self.band]
+        # A frequency set over CAT_232 wins until the band is moved by hand
+        freq = self.BAND_FREQ[self.band] if self.cat_freq is None else self.cat_freq
+        sub = self.BAND_SUB[self.band] if self.cat_sub is None else self.cat_sub
         body = [0x80, self._flags(), self.ctx]
         body += self._setup_bytes()
         body += [
             (self.band << 4) | self.input,
-            self.BAND_SUB[self.band],
+            sub,
             freq & 0xFF, (freq >> 8) & 0xFF,
             (self.cat << 4) | self.antenna,
             m["swrgain"] & 0xFF, (m["swrgain"] >> 8) & 0xFF,
@@ -530,8 +605,26 @@ class SimulateSource:
         elif op == KEY_ON and len(body) > 1:
             self._key(body[1])
             self._pending.append(self._ack() if self.rcu else self._status())
+        elif op == CAT_232 and len(body) > 2:
+            self._cat_232(body[1] | (body[2] << 8))
+            self._pending.append(self._ack() if self.rcu else self._status())
         else:
             self._pending.append(self._ack(0xFF))
+
+    # RS-232 is menu index 4 in Rev. 1.0, which is the revision this simulator
+    # reports. A real amplifier acts on CAT_232 only with that setting
+    # (protocol p. 7), so neither does this one - the precondition is worth
+    # being able to test.
+    CAT_RS232 = 4
+
+    def _cat_232(self, khz):
+        if self.cat != self.CAT_RS232:
+            return
+        sub = sub_band_for(khz)
+        if sub is None:
+            return                               # no band of ours down there
+        self.band = max(i for i, s in enumerate(SUB_BAND_START) if s <= sub)
+        self.cat_freq, self.cat_sub = khz, sub
 
     def _key(self, code):
         in_setup = 0x07 <= self.ctx <= 0x0E
@@ -568,6 +661,7 @@ class SimulateSource:
                                             + (8 if code == 0x2E else -8)))
         elif code in (0x29, 0x2A):               # BAND -/+
             self.band = (self.band + (1 if code == 0x2A else -1)) % self.BANDS
+            self.cat_freq = self.cat_sub = None  # moved by hand, drop the CAT value
         elif code == 0x2B:                       # ANT
             self.antenna = (self.antenna + 1) % 5
         elif code == 0x2C:                       # CAT
@@ -622,6 +716,883 @@ class Recorder:
             for i in range(0, len(data), 16):
                 self.fh.write(" " + " ".join(f"{b:02x}" for b in data[i:i + 16]) + "\n")
             self.fh.flush()
+
+
+# --------------------------------------------------------------------------
+# Minimal STATUS decoder
+#
+# Only what the daemon itself needs. index.html decodes the whole record - the
+# setup tree, every DISPLAY_CTX, the alarm texts - and stays the reference.
+# The two are kept honest by test/decode_test.py and test/decode.test.js
+# running against the same test/fixture.log.
+# --------------------------------------------------------------------------
+
+BANDS_M = (160, 80, 40, 30, 20, 17, 15, 12, 10, 6)
+
+
+class Framer:
+    """
+    Splits the byte stream into frames: 0xAA x3, CNT, DATA..., CHK.
+
+    The payload may contain 0xAA, so the marker alone proves nothing and the
+    checksum decides. On a mismatch we advance a single byte and try again.
+    Same rules as the framer in index.html, including the CNT bound - without
+    it two stray 0xAA bytes read as CNT=170 and the framer waits forever for
+    175 bytes that never come.
+    """
+
+    MAX_CNT = 64
+    MAX_BUF = 4096
+
+    def __init__(self, on_frame):
+        self.buf = b""
+        self.on_frame = on_frame
+        self.stats = {"ok": 0, "bad": 0, "resync": 0}
+
+    def push(self, chunk: bytes):
+        self.buf += chunk
+        b = self.buf
+        i = 0
+        while i + 5 <= len(b):
+            if not (b[i] == SYN_PA and b[i + 1] == SYN_PA and b[i + 2] == SYN_PA):
+                i += 1
+                continue
+            cnt = b[i + 3]
+            if cnt > self.MAX_CNT:               # false marker
+                self.stats["resync"] += 1
+                i += 1
+                continue
+            total = 4 + cnt + 1
+            if i + total > len(b):
+                break                            # rest arrives later
+            body = b[i + 4:i + 4 + cnt]
+            if sum(body) & 0xFF == b[i + 4 + cnt]:
+                self.stats["ok"] += 1
+                self.on_frame(body)
+                i += total
+            else:
+                self.stats["bad"] += 1
+                self.stats["resync"] += 1
+                i += 1
+        rest = b[i:]
+        if len(rest) > self.MAX_BUF:
+            rest = rest[-128:]
+        self.buf = rest
+
+
+def swr_from(pf, pr):
+    """
+    SWR out of forward and reflected power: r = sqrt(Pr/Pf), SWR = (1+r)/(1-r).
+
+    In OPERATE the amplifier does not send SWR - bytes 19-20 carry gain there -
+    so it has to be calculated. Below a few watts the ratio is noise, and None
+    means "no answer" rather than a made-up number.
+    """
+    if not pf > 5 or pr < 0 or pr >= pf:
+        return None
+    r = (pr / pf) ** 0.5
+    return (1 + r) / (1 - r)
+
+
+def decode_status(p: bytes):
+    """
+    Decode a STATUS record into the fields the daemon needs, or None.
+
+    The status code identifies the protocol revision:
+        0x80        - Rev. 1.0 (firmware 06_11_06_x)
+        0xA0 / 0xA1 - Rev. 2.0 (firmware >= 07_07_07_M), bit 0 = startup mode
+    ACK/NAK/UNK are one byte long and are not statuses; anything else short or
+    unrecognised is not ours to interpret.
+    """
+    if len(p) < 30:
+        return None
+    rev = 1 if p[0] == 0x80 else 2 if (p[0] & 0xFE) == 0xA0 else 0
+    if not rev:
+        return None
+
+    def u16(i):
+        return p[i] | (p[i + 1] << 8)
+
+    f = p[1]
+    s = {
+        "rev": rev,
+        "flags": f,                              # raw FLAGS byte, bits 0-6 used
+        "tx": bool(f & 0x04),
+        "operate": bool(f & 0x02),
+        "band": p[14] >> 4,
+        "cat": p[18] >> 4,
+        "temp": p[21],
+        "fwd": u16(22) / 10.0,                   # W
+        "ref": u16(24) / 10.0,                   # W
+    }
+    # Bytes 19-20 carry two different things, selected by FLAGS bit 1
+    raw = u16(19)
+    if s["operate"]:
+        s["swr"] = swr_from(s["fwd"], s["ref"])
+    else:
+        s["swr"] = None if raw == 0 else float("inf") if raw == 9999 else raw / 100.0
+    return s
+
+
+# The tuner's sub-bands, from the user's manual section 19 (p. 70) - the
+# protocol document gives only the index ranges, not the frequencies. 127
+# entries, indices 0..126, each the CENTRAL frequency of one sub-band in kHz.
+# Written out rather than generated so it can be checked against the manual
+# line by line: the steps are regular per band except on 17 m and 12 m.
+SUB_CENTER_KHZ = (
+    1785, 1795, 1805, 1815, 1825, 1835, 1845, 1855, 1865, 1875, 1885, 1895,
+    1905, 1915, 1925, 1935, 1945, 1955, 1965, 1975, 1985, 1995, 2005, 2015,
+    3470, 3490, 3510, 3530, 3550, 3570, 3590, 3610, 3630, 3650, 3670, 3690,
+    3710, 3730, 3750, 3770, 3790, 3810, 3830, 3850, 3870, 3890, 3910, 3930,
+    3950, 3970, 3990, 4010, 4030,
+    6963, 6988, 7013, 7038, 7063, 7088, 7113, 7138, 7163, 7188, 7213, 7238,
+    7263, 7288, 7313, 7338,
+    10075, 10125, 10175,
+    13975, 14025, 14075, 14125, 14175, 14225, 14275, 14325, 14375,
+    18075, 18125, 18165,
+    20975, 21025, 21075, 21125, 21175, 21225, 21275, 21325, 21375, 21425,
+    21475,
+    24891, 24963, 25038,
+    27950, 28050, 28150, 28250, 28350, 28450, 28550, 28650, 28750, 28850,
+    28950, 29050, 29150, 29250, 29350, 29450, 29550, 29650, 29750,
+    49750, 50250, 50750, 51250, 51750, 52250, 52750, 53250, 53750, 54250,
+)
+
+# First index of each band in SUB_CENTER_KHZ, in the band order of BANDS_M.
+SUB_BAND_START = (0, 24, 53, 69, 72, 81, 84, 95, 98, 117)
+
+
+def sub_band_for(khz):
+    """
+    The tuner's sub-band index for a frequency in kHz, or None if out of reach.
+
+    Nearest centre rather than computed edges - that handles the two irregular
+    bands (17 m steps 50 then 40, 12 m 72 then 75) with no special cases,
+    because between two centres the nearer one wins by definition.
+
+    Only the outer edges need a test: below the first centre of a band or above
+    the last one there is nothing to tune, and the gaps between bands are wide.
+    Answering with the nearest centre anyway would tune 60 m to the top of 80 m.
+    """
+    best = min(range(len(SUB_CENTER_KHZ)),
+               key=lambda i: abs(SUB_CENTER_KHZ[i] - khz))
+    band = max(i for i, start in enumerate(SUB_BAND_START) if start <= best)
+    lo = SUB_BAND_START[band]
+    hi = (SUB_BAND_START[band + 1] - 1 if band + 1 < len(SUB_BAND_START)
+          else len(SUB_CENTER_KHZ) - 1)
+    if best == lo and khz < SUB_CENTER_KHZ[lo]:
+        step = SUB_CENTER_KHZ[lo + 1] - SUB_CENTER_KHZ[lo] if hi > lo else 0
+        return None if SUB_CENTER_KHZ[lo] - khz > step / 2 else best
+    if best == hi and khz > SUB_CENTER_KHZ[hi]:
+        step = SUB_CENTER_KHZ[hi] - SUB_CENTER_KHZ[hi - 1] if hi > lo else 0
+        return None if khz - SUB_CENTER_KHZ[hi] > step / 2 else best
+    return best
+
+
+class StatusTap:
+    """
+    Frames and decodes the PA's stream, and keeps the latest picture of it.
+
+    Hangs off Hub.add_tap, so it sees the same bytes as the browser and needs
+    nothing from it. on_status is called for every decoded record - that is
+    what drives publishing, so the cadence follows the amplifier rather than a
+    timer of our own.
+    """
+
+    LINK_TIMEOUT = 3.0                           # s of silence = link is down
+
+    def __init__(self, on_status=None):
+        self.on_status = on_status
+        self.framer = Framer(self._frame)
+        self.last = None
+        self.last_at = 0.0
+        self.lock = threading.Lock()
+
+    def feed(self, data: bytes):
+        self.framer.push(data)
+
+    def _frame(self, body: bytes):
+        s = decode_status(body)
+        if s is None:
+            return
+        with self.lock:
+            self.last = s
+            self.last_at = time.time()
+        if self.on_status:
+            self.on_status(s)
+
+    def snapshot(self):
+        """The last status and whether it is still fresh."""
+        with self.lock:
+            if self.last is None:
+                return None, False
+            return self.last, time.time() - self.last_at < self.LINK_TIMEOUT
+
+
+# --------------------------------------------------------------------------
+# TrxNet
+#
+# A Python peer for the TrxNet network used across the remoteQTH device family:
+# UDP broadcast discovery plus a minimal CoAP, no broker and no router. The
+# wire format follows the C++ library and the passive sniffer that ships with
+# it - TrxNet/monitor/monitor.py, functions parse_discovery / parse_coap /
+# build_coap / build_ack. Keep the two comparable.
+#
+# Nothing here knows about amplifiers; ExpertBridge below does the joining.
+# --------------------------------------------------------------------------
+
+class TrxPeer:
+    __slots__ = ("name", "ip", "port", "last_seen")
+
+    def __init__(self, name, ip, port, last_seen):
+        self.name, self.ip, self.port, self.last_seen = name, ip, port, last_seen
+
+
+class TrxNode:
+    """One TrxNet device: discovery, subscriptions, publishing, CON retries."""
+
+    DISC_MAGIC = 0xAA
+    DISC_VERSION = 0x01
+    DISC_PROBE = 0x01
+    DISC_ANNOUNCE = 0x02
+
+    COAP_VER = 1
+    COAP_CON = 0
+    COAP_NON = 1
+    COAP_ACK = 2
+    COAP_POST = 0x02
+    COAP_EMPTY = 0x00
+    COAP_URI_PATH = 11
+
+    ANNOUNCE_S = 30.0            # TRXNET_ANNOUNCE_MS
+    PEER_TIMEOUT_S = 95.0        # TRXNET_PEER_TIMEOUT_MS, ~3 missed keepalives
+    CON_TIMEOUT_S = 2.0          # TRXNET_CON_TIMEOUT_MS
+    CON_MAX_RETRIES = 3
+    MAX_PEERS = 24               # as on ESP32; Python has no reason to skimp
+    MAX_SEEN = 64                # dedup ring for incoming CON
+    MAX_PAYLOAD = 64
+    MAX_PRIO = 8
+    PRIO_LEN = 4
+    TICK_S = 0.25
+
+    def __init__(self, name, port=5683, prio=(), on_peer=None, bind_port=None):
+        self.name = name[:31]
+        self.port = port                         # the network's port
+        # Where we listen. A device binds the network port; only a second node
+        # on the same machine (the test peer) needs its own, because two UDP
+        # sockets sharing a port split unicast between them at the kernel's
+        # discretion. The announce carries my_port, so peers reply to the right
+        # place either way.
+        self.bind_port = port if bind_port is None else bind_port
+        self.my_port = self.bind_port
+        self.prio = tuple(prio)
+        self.on_peer = on_peer
+        self.subs = {}
+        self.peers = {}                          # name -> TrxPeer
+        self.lock = threading.Lock()
+        self.sock = None
+        self._msg_id = 0
+        self._pending = []                       # unACKed CON messages
+        self._seen = deque(maxlen=self.MAX_SEEN)
+        self._last_announce = 0.0
+        self.stats = {"rx": 0, "tx": 0, "acked": 0, "lost": 0, "dropped": 0}
+
+    # -- priority prefixes (INTEGRATION.md section 5) ----------------------
+
+    @staticmethod
+    def parse_prio(text):
+        """Trim, upper-case, clamp each token to 4 chars and the list to 8."""
+        out = []
+        for tok in (text or "").split():
+            out.append(tok.upper()[:TrxNode.PRIO_LEN])
+            if len(out) == TrxNode.MAX_PRIO:
+                break
+        return tuple(out)
+
+    def is_priority(self, name):
+        return any(name.upper().startswith(p) for p in self.prio)
+
+    # -- wire format ------------------------------------------------------
+
+    def _build_discovery(self, pkt_type):
+        enc = self.name.encode("utf-8")[:31]
+        return (bytes([self.DISC_MAGIC, self.DISC_VERSION, pkt_type, len(enc)])
+                + enc + bytes([self.my_port >> 8, self.my_port & 0xFF]))
+
+    @classmethod
+    def _parse_discovery(cls, data):
+        if len(data) < 4 or data[0] != cls.DISC_MAGIC or data[1] != cls.DISC_VERSION:
+            return None
+        name_len = data[3]
+        if len(data) < 4 + name_len + 2:
+            return None
+        name = data[4:4 + name_len].decode("utf-8", errors="replace")
+        port = (data[4 + name_len] << 8) | data[4 + name_len + 1]
+        return ("probe" if data[2] == cls.DISC_PROBE else "announce", name, port)
+
+    def _build_coap(self, topic, payload, con, msg_id):
+        typ = self.COAP_CON if con else self.COAP_NON
+        buf = bytearray([(self.COAP_VER << 6) | (typ << 4), self.COAP_POST,
+                         msg_id >> 8, msg_id & 0xFF])
+        prev = 0
+        for part in [p for p in topic.lstrip("/").split("/") if p]:
+            seg = part.encode("utf-8")
+            delta = self.COAP_URI_PATH - prev
+            prev = self.COAP_URI_PATH
+            d_nib = delta if delta < 13 else 13
+            l_nib = len(seg) if len(seg) < 13 else 13
+            buf.append((d_nib << 4) | l_nib)
+            if delta >= 13:
+                buf.append(delta - 13)
+            if len(seg) >= 13:
+                buf.append(len(seg) - 13)
+            buf += seg
+        if payload:
+            buf.append(0xFF)
+            buf += payload
+        return bytes(buf)
+
+    @classmethod
+    def _parse_coap(cls, data):
+        if len(data) < 4 or ((data[0] >> 6) & 0x03) != cls.COAP_VER:
+            return None
+        typ = (data[0] >> 4) & 0x03
+        tkl = data[0] & 0x0F
+        msg_id = (data[2] << 8) | data[3]
+        if typ == cls.COAP_ACK:
+            return ("ack", msg_id, None, None)
+        if data[1] != cls.COAP_POST:
+            return None
+        pos = 4 + tkl
+        if pos > len(data):
+            return None
+        parts, opt = [], 0
+        while pos < len(data) and data[pos] != 0xFF:
+            d, l = (data[pos] >> 4) & 0x0F, data[pos] & 0x0F
+            pos += 1
+            if d == 13:
+                if pos >= len(data):
+                    return None
+                d, pos = data[pos] + 13, pos + 1
+            elif d == 14:
+                if pos + 1 >= len(data):
+                    return None
+                d, pos = ((data[pos] << 8) | data[pos + 1]) + 269, pos + 2
+            if l == 13:
+                if pos >= len(data):
+                    return None
+                l, pos = data[pos] + 13, pos + 1
+            elif l == 14:
+                if pos + 1 >= len(data):
+                    return None
+                l, pos = ((data[pos] << 8) | data[pos + 1]) + 269, pos + 2
+            opt += d
+            if opt == cls.COAP_URI_PATH and l > 0:
+                if pos + l > len(data):
+                    return None
+                parts.append(data[pos:pos + l].decode("utf-8", errors="replace"))
+            pos += l
+        payload = data[pos + 1:] if pos < len(data) and data[pos] == 0xFF else b""
+        topic = "/" + "/".join(parts) if parts else "/"
+        return ("con" if typ == cls.COAP_CON else "non", msg_id, topic, payload)
+
+    def _build_ack(self, msg_id):
+        return bytes([(self.COAP_VER << 6) | (self.COAP_ACK << 4),
+                      self.COAP_EMPTY, msg_id >> 8, msg_id & 0xFF])
+
+    # -- API --------------------------------------------------------------
+
+    def subscribe(self, path, cb):
+        self.subs[path] = cb
+
+    def publish(self, path, payload, con=False):
+        """Send to every known peer. TrxNet unicasts; it is not a broadcast."""
+        with self.lock:
+            targets = [(p.ip, p.port) for p in self.peers.values()]
+        for addr in targets:
+            self._send_msg(addr, path, payload, con)
+
+    def publish_to(self, name, path, payload, con=False):
+        with self.lock:
+            peer = self.peers.get(name)
+            addr = (peer.ip, peer.port) if peer else None
+        if addr:
+            self._send_msg(addr, path, payload, con)
+
+    def peer_list(self):
+        now = time.time()
+        with self.lock:
+            return [{"name": p.name, "ip": p.ip, "port": p.port,
+                     "ageMs": int((now - p.last_seen) * 1000),
+                     "priority": self.is_priority(p.name), "self": False}
+                    for p in sorted(self.peers.values(), key=lambda x: x.name)]
+
+    def peer_count(self):
+        with self.lock:
+            return len(self.peers)
+
+    # -- sending ----------------------------------------------------------
+
+    def _send_msg(self, addr, path, payload, con):
+        if len(payload) > self.MAX_PAYLOAD:
+            payload = payload[:self.MAX_PAYLOAD]
+        with self.lock:
+            self._msg_id = (self._msg_id + 1) & 0xFFFF
+            msg_id = self._msg_id
+        data = self._build_coap(path, payload, con, msg_id)
+        self._sendto(data, addr)
+        if con:
+            with self.lock:
+                self._pending.append({"addr": addr, "data": data, "id": msg_id,
+                                      "tries": 1, "at": time.time()})
+
+    def _sendto(self, data, addr):
+        try:
+            with self.lock:
+                if self.sock is None:
+                    return
+                self.sock.sendto(data, addr)
+            self.stats["tx"] += 1
+        except OSError as e:
+            self.stats["dropped"] += 1
+            log(f"trxnet: send to {addr[0]} failed: {e}")
+
+    # -- the loop ---------------------------------------------------------
+
+    def serve(self, stop, tick=None):
+        """Thread body: receive, keep discovery alive, retransmit, tick."""
+        import select
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        try:
+            sock.bind(("", self.bind_port))
+        except OSError as e:
+            log(f"trxnet: cannot bind UDP {self.bind_port}: {e} - TrxNet is off")
+            return
+        self.my_port = sock.getsockname()[1]     # bind_port 0 = let the OS pick
+        with self.lock:
+            self.sock = sock
+        log(f"trxnet: {self.name} on UDP {self.my_port}"
+            + (f", priority {' '.join(self.prio)}" if self.prio else ""))
+
+        self._broadcast(self.DISC_PROBE)
+        while not stop.is_set():
+            try:
+                ready, _, _ = select.select([sock], [], [], self.TICK_S)
+                if ready:
+                    data, addr = sock.recvfrom(1500)
+                    self._on_packet(data, addr)
+            except OSError as e:
+                if not stop.is_set():
+                    log(f"trxnet: socket error: {e}")
+                    time.sleep(0.5)
+            self._housekeeping()
+            if tick:
+                try:
+                    tick()
+                except Exception as e:
+                    log(f"trxnet: tick error: {e}")
+        with self.lock:
+            self.sock = None
+        sock.close()
+
+    def _broadcast(self, pkt_type):
+        self._sendto(self._build_discovery(pkt_type), ("255.255.255.255", self.port))
+
+    def _housekeeping(self):
+        now = time.time()
+        if now - self._last_announce >= self.ANNOUNCE_S:
+            self._last_announce = now
+            self._broadcast(self.DISC_ANNOUNCE)
+        with self.lock:
+            gone = [n for n, p in self.peers.items()
+                    if now - p.last_seen > self.PEER_TIMEOUT_S]
+            for n in gone:
+                del self.peers[n]
+            due = [p for p in self._pending if now - p["at"] >= self.CON_TIMEOUT_S]
+            for p in due:
+                if p["tries"] >= self.CON_MAX_RETRIES:
+                    self._pending.remove(p)
+                    self.stats["lost"] += 1
+                else:
+                    p["tries"] += 1
+                    p["at"] = now
+        for n in gone:
+            log(f"trxnet: peer {n} timed out")
+        for p in due:
+            if p in self._pending:
+                self._sendto(p["data"], p["addr"])
+
+    # -- receiving --------------------------------------------------------
+
+    def _on_packet(self, data, addr):
+        self.stats["rx"] += 1
+        if not data:
+            return
+        if data[0] == self.DISC_MAGIC:
+            self._on_discovery(data, addr)
+        elif ((data[0] >> 6) & 0x03) == self.COAP_VER:
+            self._on_coap(data, addr)
+
+    def _on_discovery(self, data, addr):
+        parsed = self._parse_discovery(data)
+        if not parsed:
+            return
+        kind, name, port = parsed
+        if name == self.name:                    # our own broadcast coming back
+            return
+        fresh = self._touch_peer(name, addr[0], port)
+        if kind == "probe":                      # answer with a unicast announce
+            self._sendto(self._build_discovery(self.DISC_ANNOUNCE), (addr[0], port))
+        if fresh:
+            log(f"trxnet: peer {name} at {addr[0]}:{port}")
+            if self.on_peer:
+                self.on_peer(name)               # must not send from here
+
+    def _touch_peer(self, name, ip, port):
+        """Add or refresh a peer. Returns True when it is a new one."""
+        now = time.time()
+        with self.lock:
+            peer = self.peers.get(name)
+            if peer:
+                peer.ip, peer.port, peer.last_seen = ip, port, now
+                return False
+            if len(self.peers) >= self.MAX_PEERS:
+                # Table full: a priority newcomer evicts the stalest ordinary
+                # peer, anything else is dropped (section 5 of the profile).
+                if not self.is_priority(name):
+                    self.stats["dropped"] += 1
+                    return False
+                ordinary = [p for p in self.peers.values()
+                            if not self.is_priority(p.name)]
+                if not ordinary:
+                    self.stats["dropped"] += 1
+                    return False
+                del self.peers[min(ordinary, key=lambda p: p.last_seen).name]
+            self.peers[name] = TrxPeer(name, ip, port, now)
+            return True
+
+    def _on_coap(self, data, addr):
+        parsed = self._parse_coap(data)
+        if not parsed:
+            return
+        kind, msg_id, topic, payload = parsed
+        if kind == "ack":
+            with self.lock:
+                for p in list(self._pending):
+                    if p["id"] == msg_id and p["addr"][0] == addr[0]:
+                        self._pending.remove(p)
+                        self.stats["acked"] += 1
+            return
+        if kind == "con":
+            self._sendto(self._build_ack(msg_id), addr)
+            # CON is at-least-once: it is retransmitted until ACKed, so without
+            # this ring a repeated /s-tune would fire the key twice.
+            key = (addr[0], msg_id)
+            if key in self._seen:
+                return
+            self._seen.append(key)
+        cb = self.subs.get(topic)
+        if cb:
+            name = self._name_of(addr[0])
+            try:
+                cb(name, payload)
+            except Exception as e:
+                log(f"trxnet: handler for {topic} failed: {e}")
+
+    def _name_of(self, ip):
+        with self.lock:
+            for p in self.peers.values():
+                if p.ip == ip:
+                    return p.name
+        return ip
+
+
+# --------------------------------------------------------------------------
+# The amplifier as a TrxNet device
+# --------------------------------------------------------------------------
+
+class _Want:
+    """One outstanding command: a value, a deadline and a retry count."""
+
+    __slots__ = ("value", "deadline", "tries", "sent_at")
+
+    def __init__(self, value, deadline):
+        self.value = value
+        self.deadline = deadline
+        self.tries = 0
+        self.sent_at = 0.0
+
+
+class ExpertBridge:
+    """
+    Maps the amplifier onto TrxNet topics and TrxNet commands onto keystrokes.
+
+    Publishing is driven by the STATUS stream, so the cadence follows the
+    amplifier: everything while transmitting, on change plus a heartbeat
+    otherwise. Commands run a closed loop - the two mode keys are toggles, not
+    setters, so a blind keystroke is as likely to switch the wrong way.
+    """
+
+    HEARTBEAT_S = 5.0            # republish an unchanged value this often
+    HOLD_S = 10.0                # keep a command this long while the link is down
+    RETRY_S = 0.4                # between keystrokes, as the setup walker does
+    MAX_TRIES = 6
+    CAT_REFRESH_S = 1.0          # slow catch-up so the PA's display tracks
+    TUNE_CONFIRM_S = 1.0
+
+    CAT_RS232 = {1: 4, 2: 6}     # menu index of RS-232, by protocol revision
+
+    def __init__(self, hub, tap, node, publish_on=True, subscribe_on=False,
+                 allow=()):
+        self.hub = hub
+        self.tap = tap
+        self.node = node
+        self.publish_on = publish_on
+        self.subscribe_on = subscribe_on
+        self.allow = tuple(allow)
+        self.lock = threading.Lock()
+
+        self._last = {}                          # topic -> (payload, time)
+        self._greet = deque()                    # peers waiting for a snapshot
+        self._want = {}                          # what a peer asked for
+        self._want_hz = None                     # last commanded frequency, Hz
+        self._sent_khz = None
+        self._sent_sub = None
+        self._sent_at = 0.0
+        self._tune_at = 0.0
+        self.cat_ok = None                       # None = not known yet
+        self._cat_warned = False
+
+        tap.on_status = self._on_status
+        node.on_peer = self._on_peer
+        if subscribe_on:
+            node.subscribe("/hz", self._on_hz)
+            node.subscribe("/s-on", lambda f, d: self._on_cmd("on", f, d))
+            node.subscribe("/s-operate", lambda f, d: self._on_cmd("operate", f, d))
+            node.subscribe("/s-full", lambda f, d: self._on_cmd("full", f, d))
+            node.subscribe("/s-tune", lambda f, d: self._on_cmd("tune", f, d))
+
+    # -- outgoing: the amplifier's state ----------------------------------
+
+    def _values(self, s):
+        """The five published payloads, or None where there is no answer."""
+        on = bool(self.hub.source.dtr_state())
+        _, link = self.tap.snapshot()
+        flags = s["flags"] & 0x7F                # bit 7 means two things by rev
+        if on:
+            flags |= 0x100
+        if link:
+            flags |= 0x200
+        if s["rev"] == 2:
+            flags |= 0x400
+
+        swr = s["swr"]
+        if swr is None:
+            swr_raw = 0                          # 0 = no answer
+        elif swr == float("inf"):
+            swr_raw = 0xFFFF
+        else:
+            swr_raw = min(0xFFFF, int(round(swr * 100)))
+
+        band = BANDS_M[s["band"]] if s["band"] < len(BANDS_M) else 0
+        return {
+            "/pa-flags": struct.pack("<H", flags),
+            "/fwd": struct.pack("<H", min(0xFFFF, int(round(s["fwd"] * 10)))),
+            "/ref": struct.pack("<H", min(0xFFFF, int(round(s["ref"] * 10)))),
+            "/swr": struct.pack("<H", swr_raw),
+            "/band": struct.pack("B", band),
+        }
+
+    def _on_status(self, s):
+        """Called for every decoded STATUS - from the serial thread."""
+        self._check_cat(s)
+        if not self.publish_on:
+            return
+        vals = self._values(s)
+        now = time.time()
+        # While transmitting the point is the instantaneous number, so every
+        # packet goes out. Otherwise a value that has not moved is worth one
+        # heartbeat. The trailing zeros after PTT drops are a change, so they
+        # are published without a special case.
+        live = {"/fwd", "/ref", "/swr"} if s["tx"] else set()
+        for topic, payload in vals.items():
+            prev = self._last.get(topic)
+            if (topic in live or prev is None or prev[0] != payload
+                    or now - prev[1] >= self.HEARTBEAT_S):
+                self._last[topic] = (payload, now)
+                self.node.publish(topic, payload)
+
+    def _check_cat(self, s):
+        """CAT_232 only has an effect with CAT set to RS-232 in the PA's menu."""
+        want = self.CAT_RS232.get(s["rev"])
+        self.cat_ok = s["cat"] == want
+        if not self.cat_ok and not self._cat_warned:
+            self._cat_warned = True
+            log(f"trxnet: the PA has CAT index {s['cat']}, not RS-232 "
+                f"({want}) - CAT_232 frames may have no effect")
+        elif self.cat_ok:
+            self._cat_warned = False
+
+    def _on_peer(self, name):
+        """A peer joined; greet it with the current state (from the UDP thread)."""
+        if self.publish_on:
+            self._greet.append(name)
+
+    def _drain_greet(self):
+        """One peer per tick, so a CON burst never piles up."""
+        if not self._greet:
+            return
+        name = self._greet.popleft()
+        s, _ = self.tap.snapshot()
+        if s is None:
+            return
+        for topic, payload in self._values(s).items():
+            self.node.publish_to(name, topic, payload, con=True)
+
+    # -- incoming: commands -----------------------------------------------
+
+    def _allowed(self, sender):
+        if not self.allow:
+            return True
+        return any(sender.upper().startswith(a.upper()) for a in self.allow)
+
+    def _on_hz(self, sender, data):
+        if len(data) < 4:
+            return
+        if not self._allowed(sender):
+            log(f"trxnet: /hz from {sender} ignored (not in the allow list)")
+            return
+        with self.lock:
+            self._want_hz = struct.unpack_from("<I", data)[0]
+        self.hub.note_activity()
+
+    def _on_cmd(self, what, sender, data):
+        if len(data) < 1:
+            return
+        if not self._allowed(sender):
+            log(f"trxnet: /s-{what} from {sender} ignored (not in the allow list)")
+            return
+        value = bool(data[0])
+        if what == "tune" and not value:
+            return                               # TUNE is momentary, 0 is a no-op
+        with self.lock:
+            self._want[what] = _Want(value, time.time() + self.HOLD_S)
+        self.hub.note_activity()
+        log(f"trxnet: /s-{what} {int(value)} from {sender}")
+
+    # -- the tick ---------------------------------------------------------
+
+    def tick(self):
+        """Called from the TrxNode loop, four times a second."""
+        self._drain_greet()
+        self._tick_freq()
+        self._tick_cmds()
+
+    def _tick_freq(self):
+        with self.lock:
+            hz = self._want_hz
+        if hz is None:
+            return
+        khz = hz // 1000
+        sub = sub_band_for(khz)
+        if sub is None:
+            return                               # the PA has no band there
+        now = time.time()
+        if sub != self._sent_sub:
+            pass                                 # a new sub-band tunes at once
+        elif khz != self._sent_khz and now - self._sent_at >= self.CAT_REFRESH_S:
+            pass                                 # slow catch-up for the display
+        else:
+            return
+        # The real frequency goes on the wire; the table only decides when.
+        if self.hub.send(frame(CAT_232, khz & 0xFF, (khz >> 8) & 0xFF)):
+            self._sent_khz, self._sent_sub, self._sent_at = khz, sub, now
+
+    def _tick_cmds(self):
+        with self.lock:
+            items = list(self._want.items())
+        if not items:
+            return
+        s, link = self.tap.snapshot()
+        now = time.time()
+        for what, want in items:
+            if what == "on":
+                self._do_power(want.value)
+                self._done(what)
+                continue
+            if not link:
+                # Nothing to check against yet. A PA that was just switched on
+                # takes about seven seconds, which is exactly the case this
+                # hold is for.
+                if now > want.deadline:
+                    log(f"trxnet: /s-{what} dropped - no telemetry for "
+                        f"{self.HOLD_S:.0f} s")
+                    self._done(what)
+                continue
+            if what == "tune":
+                self._do_tune(s, want, now)
+                continue
+            reached = s["operate"] if what == "operate" else bool(s["flags"] & 0x10)
+            if reached == want.value:
+                self._done(what)
+                continue
+            if now - want.sent_at < self.RETRY_S:
+                continue
+            want.tries += 1
+            if want.tries > self.MAX_TRIES:
+                log(f"trxnet: /s-{what} gave up - the amplifier did not follow")
+                self._done(what)
+                continue
+            want.sent_at = now
+            self.hub.send_key(KEY_OPERATE if what == "operate" else KEY_MODE)
+
+    def _do_power(self, on):
+        src = self.hub.source
+        if self.hub.dtr_mode == "pulse":
+            if on:
+                threading.Thread(target=src.dtr_pulse, daemon=True).start()
+            else:
+                self.hub.send(FRAME_OFF, rate_limited=False)
+        else:
+            src.set_dtr(on)
+
+    def _do_tune(self, s, want, now):
+        """TUNE is momentary: press once, then check the flag actually rose."""
+        if not want.sent_at:
+            want.sent_at = now
+            self.hub.send_key(KEY_TUNE)
+            return
+        if s["flags"] & 0x01:                    # tuning started
+            self._done("tune")
+        elif now - want.sent_at >= self.TUNE_CONFIRM_S:
+            log("trxnet: /s-tune had no effect - transmitting, or in STANDBY?")
+            self._done("tune")
+
+    def _done(self, what):
+        with self.lock:
+            self._want.pop(what, None)
+
+    # -- diagnostics (INTEGRATION.md section 8.2) -------------------------
+
+    def health(self):
+        peers = self.node.peer_list()
+        return {
+            "self": {
+                "name": self.node.name,
+                "port": self.node.port,
+                "enabled": True,
+                "publishOn": self.publish_on,
+                "subscribeOn": self.subscribe_on,
+                "peerCount": len(peers),
+                "peerMax": TrxNode.MAX_PEERS,
+                "tableFull": len(peers) >= TrxNode.MAX_PEERS,
+            },
+            "peers": peers,
+            "stats": self.node.stats,
+        }
 
 
 # --------------------------------------------------------------------------
@@ -682,6 +1653,7 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     hub = None
     args = None
+    bridge = None                # set when TrxNet is running
 
     def log_message(self, *a):
         pass                                     # bez sumu do konzole
@@ -758,7 +1730,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "not found"}, 404)
 
     def _health(self):
-        return {
+        h = {
             "source": self.hub.source.describe(),
             "clients": self.hub.client_count(),
             "raw_client": self.hub.has_raw(),
@@ -767,6 +1739,15 @@ class Handler(BaseHTTPRequestHandler):
             "dtr": self.hub.source.dtr_state(),
             "stats": self.hub.stats,
         }
+        if self.bridge is not None:
+            # Shape per INTEGRATION.md section 8.2, so the monitor, NodeRed and
+            # companion UIs all read one thing.
+            h["trxnet"] = self.bridge.health()
+            h["cat_ok"] = self.bridge.cat_ok
+            if self.bridge.cat_ok is False:
+                h["cat_hint"] = ("CAT_232 needs CAT set to RS-232 in the "
+                                 "amplifier's menu")
+        return h
 
     def _stream(self):
         """SSE: every chunk from the serial port goes out as an rx / tx event."""
@@ -893,6 +1874,46 @@ def do_bundle(dest):
           f"folded in - runs on its own")
 
 
+def start_trxnet(hub, args, stop):
+    """
+    Bring the TrxNet node up, or return None when it is not wanted.
+
+    The enable rule is the profile's (INTEGRATION.md section 3): the stack
+    starts only with the switch on AND a NET_ID other than the reserved 0x00.
+    They are separate settings so that switching TrxNet off does not lose the
+    configured ID.
+    """
+    if not args.trxnet:
+        return None
+    try:
+        net_id = int(args.trxnet_id, 16)
+    except ValueError:
+        sys.exit(f"--trxnet-id takes two hex digits, not {args.trxnet_id!r}")
+    if not 0 <= net_id <= 0xFF:
+        sys.exit("--trxnet-id is out of range (00-ff)")
+    if net_id == 0:
+        sys.exit("--trxnet-id 00 is the reserved 'disabled' value - "
+                 "pick another ID, or leave out --trxnet")
+
+    name = f"{args.trxnet_type}.{net_id:02x}"
+    node = TrxNode(name, args.trxnet_port, TrxNode.parse_prio(args.trxnet_prio))
+    tap = StatusTap()
+    hub.add_tap(tap.feed)
+    bridge = ExpertBridge(hub, tap, node,
+                          publish_on=not args.trxnet_no_publish,
+                          subscribe_on=args.trxnet_subscribe,
+                          allow=args.trxnet_allow.split())
+    threading.Thread(target=node.serve, args=(stop, bridge.tick),
+                     daemon=True).start()
+    log(f"trxnet: {name}, publish {'on' if bridge.publish_on else 'off'}, "
+        f"subscribe {'on' if bridge.subscribe_on else 'off'}"
+        + (f", allow {' '.join(bridge.allow)}" if bridge.allow else ""))
+    if bridge.subscribe_on and not bridge.allow:
+        log("trxnet: any device on the segment can command the amplifier "
+            "- see --trxnet-allow")
+    return bridge
+
+
 def main():
     p = argparse.ArgumentParser(description="EXPERT 1K-FA - web console")
     src = p.add_mutually_exclusive_group()
@@ -927,6 +1948,33 @@ def main():
     p.add_argument("--bundle", metavar="FILE",
                    help="write a standalone copy with index.html folded in "
                         "and exit; the bundle needs no companion files")
+
+    t = p.add_argument_group(
+        "TrxNet",
+        "Join the remoteQTH device network as PA.<id>. The console then works "
+        "with no browser open at all.")
+    t.add_argument("--trxnet", action="store_true", help="join the network")
+    t.add_argument("--trxnet-id", default="01", metavar="HEX",
+                   help="NET_ID as two hex digits; 00 is the reserved "
+                        "'disabled' value and refuses to start")
+    t.add_argument("--trxnet-type", default="PA", metavar="TYPE",
+                   help="device type prefix, giving names like PA.01")
+    t.add_argument("--trxnet-port", type=int, default=5683,
+                   help="UDP port; every device on the network shares it")
+    t.add_argument("--trxnet-subscribe", action="store_true",
+                   help="act on commands from the network. Off by default: "
+                        "TrxNet has no authentication, so anyone on the "
+                        "segment could otherwise start a tune")
+    t.add_argument("--trxnet-no-publish", action="store_true",
+                   help="stay silent - announce presence but publish no state")
+    t.add_argument("--trxnet-prio", default="", metavar="LIST",
+                   help='space-separated name prefixes to keep when the peer '
+                        'table fills, e.g. "705 OI3"')
+    t.add_argument("--trxnet-allow", default="", metavar="LIST",
+                   help="space-separated peer names allowed to command the "
+                        "amplifier; empty means anyone. The sender's name is "
+                        "unsigned, so this guards against a misconfigured "
+                        "device, not against an attacker")
     args = p.parse_args()
 
     if args.bundle:
@@ -969,14 +2017,27 @@ def main():
                          args=(hub, args.raw_port, args.listen, stop),
                          daemon=True).start()
 
+    bridge = start_trxnet(hub, args, stop)
+
     def watchdog():
+        """
+        Keeps the telemetry stream alive and minds auto-shutdown.
+
+        The RCU_ON watchdog runs whether or not TrxNet does: without it the
+        daemon sees nothing unless a browser happens to be open, which is
+        exactly what this whole exercise is about.
+        """
+        tick = 0
         while not stop.is_set():
-            time.sleep(5)
-            hub.tick_auto_shutdown()
+            time.sleep(0.5)
+            hub.tick_rcu()
+            tick += 1
+            if tick % 10 == 0:
+                hub.tick_auto_shutdown()
 
     threading.Thread(target=watchdog, daemon=True).start()
 
-    Handler.hub, Handler.args = hub, args
+    Handler.hub, Handler.args, Handler.bridge = hub, args, bridge
     httpd = ThreadingHTTPServer((args.listen, args.http_port), Handler)
     httpd.daemon_threads = True
 

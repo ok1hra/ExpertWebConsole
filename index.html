@@ -238,6 +238,10 @@
         <span class="hint" id="probeOut" style="margin:0"></span>
       </div>
       <div class="hint" id="unknown" style="margin:8px 0 0"></div>
+      <div id="trxWrap" style="display:none">
+        <div class="status" id="trxSelf" style="margin-top:8px"></div>
+        <div class="tree" id="trxPeers" style="margin-top:6px"></div>
+      </div>
       <div class="dbg" id="dbg"></div>
       <div style="margin-top:8px"><button id="btnClear">Clear log</button></div>
     </div>
@@ -1183,6 +1187,30 @@ function renderDiag(framer) {
   if (lastUnknown) el("unknown").textContent = "Undecoded frame:  " + lastUnknown;
 }
 
+/* TrxNet - read-only. The daemon owns the network; the page only shows what
+   /health reports, in the canonical shape of INTEGRATION.md section 8.2. */
+function renderTrxnet(h) {
+  const t = h && h.trxnet;
+  el("trxWrap").style.display = t ? "" : "none";
+  if (!t) return;
+  const me = t.self;
+  el("trxSelf").innerHTML =
+    cell("TrxNet", me.name) +
+    cell("UDP", me.port) +
+    cell("Peers", me.peerCount + " / " + me.peerMax) +
+    cell("Publish", me.publishOn ? "on" : "off") +
+    cell("Subscribe", me.subscribeOn ? "on" : "off") +
+    cell("CAT", h.cat_ok === false ? "not RS-232" : h.cat_ok ? "RS-232" : "—");
+  const rows = t.peers.map(p =>
+    `<div class="leaf"><span class="ro">${p.priority ? "*" : " "} ` +
+    `${p.name.padEnd(10)} ${p.ip.padEnd(15)} ${(p.ageMs / 1000).toFixed(0)} s` +
+    `</span></div>`).join("");
+  el("trxPeers").innerHTML =
+    `<div class="tnode live"><span class="tname">PEERS` +
+    (me.tableFull ? " - TABLE FULL, peers are being dropped" : "") +
+    `</span></div>` + (rows || `<div class="leaf"><span class="ro">none</span></div>`);
+}
+
 /* ====================================================================== *
  *  Link + RCU session
  *
@@ -1227,6 +1255,7 @@ function connect() {
     if (h.dtr_mode) dtrMode = h.dtr_mode;
     if ("dtr" in h) dtrOn = h.dtr;
     renderPower();
+    renderTrxnet(h);
     setConn(true);
     dbg("· " + h.source);
     sendRcuOn();
@@ -1258,6 +1287,7 @@ setInterval(async () => {
     try {
       const h = await (await fetch("/health")).json();
       if ("dtr" in h && h.dtr !== dtrOn) { dtrOn = h.dtr; renderPower(); }
+      renderTrxnet(h);
     } catch (e) { /* offline, handled elsewhere */ }
   }
 }, 1000);

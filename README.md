@@ -4,8 +4,11 @@
 
 A web replacement for `Expert_Console2.exe`, the Windows console for the SPE
 EXPERT 1K-FA linear amplifier — usable from a remote QTH. A small daemon owns
-the serial port and serves its own page; all protocol knowledge lives in
-`index.html`.
+the serial port and serves its own page; the protocol lives in `index.html`.
+
+With `--trxnet` the daemon also joins the [TrxNet](https://github.com/ok1hra/TrxNet)
+device network as `PA.01` and keeps working **with no browser open at all** —
+see [TrxNet](#trxnet).
 
 ---
 
@@ -49,10 +52,17 @@ port taken", "does DTR switch" and "does the amplifier reply":
 
     browser ──http──► expert_console.py ──► /dev/ttyUSB.pa ──► 1K-FA
                       (HTML + SSE + serial)      9600 8N1
+      TrxNet ──udp──►
 
 The daemon is deliberately thin: serial port, DTR, HTTP, and passing bytes
 through. Framing, checksums, the 30-byte status record and the setup menus are
 all decoded in the browser.
+
+The one exception is TrxNet. A network device cannot depend on someone having a
+page open, so the daemon carries its own framer and decodes the handful of
+STATUS fields it publishes — about sixty lines, deliberately not the whole
+record. `test/decode_test.py` and `test/decode.test.js` run against the same
+`test/fixture.log`, which is what keeps the two decoders from drifting apart.
 
 ## Running the original Windows console under wine
 
@@ -189,6 +199,121 @@ Where selecting an item *is* the value (`SET CAT`, `SET YAESU/ICOM/TEN-TEC`,
 > The route into `SET BAUDRATE` is not documented in the specification, so the
 > walker will not enter it — the manual arrows still work.
 
+## TrxNet
+
+The console can join [TrxNet](https://github.com/ok1hra/TrxNet), the P2P network
+the remoteQTH devices use — UDP broadcast discovery, a minimal CoAP, no broker.
+The amplifier appears as `PA.01`, follows the transceiver's frequency and can be
+operated from any other device on the segment.
+
+    ./expert_console.py --port /dev/ttyUSB.pa --trxnet --trxnet-id 01
+
+**This works with no browser open.** The daemon runs the `RCU_ON` watchdog
+itself — which it now does whether or not TrxNet is on, so `--record` is useful
+headless too.
+
+### Topics
+
+Payloads are raw little-endian, as everywhere in TrxNet.
+
+| Published | Type | Encoding |
+|---|---|---|
+| `/pa-flags` | u16 | bit map below |
+| `/fwd` | u16 | forward power, W × 10, instantaneous (not the peak the bars show) |
+| `/ref` | u16 | reflected power, W × 10, instantaneous |
+| `/swr` | u16 | SWR × 100; `0` = no answer, `65535` = ∞ |
+| `/band` | u8 | metres: 160, 80, 40, 30, 20, 17, 15, 12, 10, 6 |
+
+    /pa-flags
+    bit  0  TUNE      ┐
+         1  OPERATE   │
+         2  TX        │ the amplifier's own FLAGS byte,
+         3  ALARM     │ bits 0-6 passed through unchanged
+         4  FULL      │
+         5  CONTEST   │
+         6  BEEP      ┘
+         7  always 0    PA_PROT in Rev. 1.0, T_SCALE in Rev. 2.0 — it would
+                        mean two different things on the wire
+         8  ON          DTR high, the amplifier is running
+         9  LINK        STATUS packets are arriving (< 3 s)
+        10  REV2        1 = Rev. 2.0, 0 = Rev. 1.0
+     11-15  reserved, zero
+
+> Why not plain `/flags`? That name is taken: the IC-705 interface publishes a
+> CI-V bitfield under it (PTT, SPLIT, RIT…), and a consumer that met both would
+> read one as the other. It already happens — the TrxNet Monitor decodes
+> `/flags` as CI-V, so an amplifier in OPERATE and FULL would show up as
+> "SPLIT | AFC | NR". A topic of our own means anything that does not know the
+> amplifier prints raw hex, which is at least visibly undecoded.
+
+| Subscribed | Type | Effect |
+|---|---|---|
+| `/hz` | u32 | the transceiver's frequency in Hz → `CAT_232` |
+| `/s-on` | u8 | 0/1 → DTR low/high |
+| `/s-operate` | u8 | 0 = STANDBY, 1 = OPERATE |
+| `/s-full` | u8 | 0 = HALF (PWR-L), 1 = FULL (PWR-H) |
+| `/s-tune` | u8 | 1 = start tuning |
+
+While transmitting, `/fwd` `/ref` `/swr` go out with every STATUS packet — five
+to eight a second, which is the point of an instantaneous reading. Otherwise
+they are sent on change plus a heartbeat every five seconds. A peer that joins
+gets the whole set at once, as `TRX_CON`.
+
+### Commands are not keystrokes
+
+`OPERATE` and `PWR-L/H` are **toggle keys**, so a blind press is as likely to
+switch the wrong way. Each command therefore runs a closed loop — compare, send
+one key, wait for the next STATUS to confirm, up to six times — the same
+approach the setup tree walker uses. Sending `/s-operate 1` twice leaves the
+amplifier in OPERATE, as it should.
+
+A command that arrives while no telemetry is flowing is held for ten seconds and
+then dropped. That covers the one case worth covering: `/s-on 1` and
+`/s-operate 1` sent together, with the amplifier taking about seven seconds to
+come up.
+
+### Following the transceiver
+
+`/hz` is turned into a `CAT_232` frame (`0x82 LO HI`, kHz). A frame goes out at
+once when the frequency crosses into another of the tuner's 127 sub-bands, and
+otherwise at most once a second, so the frequency on the amplifier's display
+keeps up without flooding a link that allows eight commands a second.
+
+> ⚠️ `CAT_232` only has an effect with **CAT set to `RS-232`** in the amplifier's
+> menu (protocol Rev. 2.0, p. 7). The daemon says so in the log and in
+> `/health`, and keeps sending regardless. Note what that setting costs: the
+> amplifier then ignores the transceiver's own CAT bus and follows the daemon
+> instead.
+
+The sub-band table is transcribed from the **user's manual §19** (p. 70) — the
+protocol document gives only the index ranges. `test/subband_test.py` checks it
+against that table band by band.
+
+### Who may command the amplifier
+
+`--trxnet-subscribe` is **off by default**. TrxNet has no authentication of any
+kind, so with it on, anything on the segment can start a tune into whatever
+antenna happens to be selected.
+
+    --trxnet-allow "705.01 OI3.ff"
+
+restricts commands to those names. Be clear about what that buys: the sender's
+name is carried unsigned in the packet, so an allow list guards against a
+misconfigured device, **not** against an attacker. It is not optional in one
+case though — `/hz` is published by the OI3 keyer as well as the IC-705, and
+without a list the amplifier would follow whichever spoke last.
+
+### Diagnostics
+
+`/health` grows a `trxnet` block in the canonical shape of the profile
+(`INTEGRATION.md` §8.2), and the Diagnostics panel shows the same thing:
+
+    curl -s localhost:8080/health | jq .trxnet
+
+`tableFull` is the one to look at when a device is missing: the peer table
+filled and somebody was dropped. `--trxnet-prio "705 OI3"` protects the names
+that matter.
+
 ## Losing the address bar and tabs
 
 **1. Application mode — works immediately, nothing to prepare:**
@@ -222,6 +347,20 @@ does not need `mod_proxy_wstunnel`:
       ProxyPassReverse http://127.0.0.1:8080/
       SetEnv proxy-sendchunked 1
     </Location>
+
+### With TrxNet
+
+    [Service]
+    ExecStart=/opt/expert/expert_console.py --port /dev/ttyUSB.pa \
+              --raw-port 7373 --listen 127.0.0.1 --http-port 8080 \
+              --trxnet --trxnet-id 01 --trxnet-subscribe \
+              --trxnet-allow "705.01" --trxnet-prio "705 OI3"
+    Restart=always
+    User=dan
+
+Discovery is a **broadcast**: it does not cross routers or subnets, and guest
+networks, mesh systems and AP client isolation all silently swallow it. Check it
+on the network it will actually run on.
 
 ### Migrating from ser2net
 
@@ -259,10 +398,25 @@ the ceiling for the link.
 4. Confirm that `0x33` is `C+` and not `L+`, by comparison with the original.
 5. `TUNE` and `OPERATE` last, into a load.
 
+With `--trxnet --trxnet-subscribe`, in this order:
+
+6. `/s-on 1` → DTR rises, the PA comes up in about 7 s, `/pa-flags` bits 8 and 9
+7. `/s-full` there and back — and **twice the same value**, which must not
+   toggle it
+8. `/hz` from a live transceiver → the bands follow, `/band` matches the front
+   panel
+9. `/s-tune` **into a dummy load**, last of all
+
 ## Tests
 
     ./test/run.sh          # decoder and rendering, no hardware needed
     ./test/run.sh --e2e    # plus end-to-end against the simulator
+
+`decode_test.py` covers the daemon's own decoder and `subband_test.py` the
+tuner's sub-band table; `trxnet_e2e.py` joins a real TrxNet peer to the
+simulator and drives the amplifier over the network. That last one binds
+**port 5799, not 5683** — on a machine sitting on the real network, a test
+announcing itself as `PA.01` would be picked up by the actual fleet.
 
 `decode.test.js` and `render.test.js` run **code extracted from `index.html`**
 rather than a copy of it, so what gets tested is what actually ships.
@@ -305,11 +459,23 @@ gitignored, and running `--bundle` on a bundle is refused.
 | `--dtr-on-start` | off | power the amplifier up as the daemon starts |
 | `--dtr-pulse-ms` | `1000` | pulse length, `--dtr-mode pulse` only |
 | `--bundle FILE` | — | write a standalone copy with the page folded in, then exit |
+| `--trxnet` | off | join the TrxNet network |
+| `--trxnet-id` | `01` | NET_ID, two hex digits; `00` is the reserved "disabled" value |
+| `--trxnet-type` | `PA` | device type prefix, giving `PA.01` |
+| `--trxnet-port` | `5683` | UDP port, shared by every device on the network |
+| `--trxnet-subscribe` | off | act on commands from the network |
+| `--trxnet-no-publish` | off | announce presence but publish no state |
+| `--trxnet-prio` | — | name prefixes to keep when the peer table fills |
+| `--trxnet-allow` | — | peer names allowed to command the amplifier; empty = anyone |
 
 ## Scope
 
-Out of scope: `CAT_232` tuning, server-side telemetry logging, multiple
-amplifiers.
+Out of scope: walking the setup menus from the daemon (antennas, CAT, backlight
+stay in the browser), server-side telemetry logging, multiple amplifiers.
+
+`CAT_232` used to be out of scope and no longer is — it is how `/hz` reaches the
+amplifier. The daemon does not publish `/hz` itself: it subscribes to it, and
+publishing the same topic would feed a loop back through the other devices.
 
 ## Sources
 
