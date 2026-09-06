@@ -25,6 +25,10 @@ echo "== tabulka sub-pasem =="
 python3 subband_test.py
 
 echo
+echo "== prepinaci klavesy proti mlcicimu zesilovaci =="
+python3 toggle_test.py
+
+echo
 echo "== vykreslovani (DOM shim) =="
 python3 make-fixture.py >/dev/null
 node render.test.js

@@ -259,13 +259,36 @@ to eight a second, which is the point of an instantaneous reading. Otherwise
 they are sent on change plus a heartbeat every five seconds. A peer that joins
 gets the whole set at once, as `TRX_CON`.
 
+**With the amplifier switched off the topics keep going**, on the same
+heartbeat: `/pa-flags` carries bit 8 from DTR and bit 9 clear, and the readings
+go out as "no answer". Bits 8 and 9 are the daemon's own knowledge, not the
+amplifier's, and they are exactly the two worth having when no telemetry
+flows — a consumer that hears nothing at all cannot tell "switched off" from
+"gone", and a panel whose `ON` button toggles over the last value it heard then
+keeps sending the opposite one, with nothing able to correct it.
+
 ### Commands are not keystrokes
 
 `OPERATE` and `PWR-L/H` are **toggle keys**, so a blind press is as likely to
 switch the wrong way. Each command therefore runs a closed loop — compare, send
-one key, wait for the next STATUS to confirm, up to six times — the same
+one key, wait for the amplifier to confirm, up to three times — the same
 approach the setup tree walker uses. Sending `/s-operate 1` twice leaves the
 amplifier in OPERATE, as it should.
+
+What "wait for the amplifier to confirm" has to mean is **a STATUS newer than
+the keystroke**, not a timer. Measured on the wire: the amplifier ACKs an
+`OPERATE` key in 52 ms and then goes completely quiet for about **1.2 s** while
+it throws the relays — no ACK and no STATUS, though the stream otherwise runs at
+eight packets a second. A loop retrying on a wall clock therefore pressed a
+toggle key two more times inside the window in which it could not possibly have
+answered, and the parity of the press count decided where the amplifier ended
+up. It even looked like a success: the loop saw `OPERATE` arrive, called itself
+done, and the presses already inside the amplifier undid it a second later —
+which is precisely "it went to OPERATE and came back after two seconds". So a
+retry now waits for a STATUS that arrived at least 1.5 s after the keystroke and
+still disagrees; while the amplifier is quiet, nothing is sent. `test/toggle_test.py`
+holds the amplifier silent for the measured 1.2 s and fails on the second
+keystroke.
 
 A command that arrives while no telemetry is flowing is held for ten seconds and
 then dropped. That covers the one case worth covering: `/s-on 1` and
@@ -413,8 +436,11 @@ With `--trxnet --trxnet-subscribe`, in this order:
     ./test/run.sh --e2e    # plus end-to-end against the simulator
 
 `decode_test.py` covers the daemon's own decoder and `subband_test.py` the
-tuner's sub-band table; `trxnet_e2e.py` joins a real TrxNet peer to the
-simulator and drives the amplifier over the network. That last one binds
+tuner's sub-band table; `toggle_test.py` drives the command loop against an
+amplifier that falls silent for the measured 1.2 s, which the simulator cannot
+show because it flips on the byte; `trxnet_e2e.py` joins a real TrxNet peer to
+the simulator and drives the amplifier over the network — including with the
+amplifier switched off, where the topics have to keep going. That last one binds
 **port 5799, not 5683** — on a machine sitting on the real network, a test
 announcing itself as `PA.01` would be picked up by the actual fleet.
 

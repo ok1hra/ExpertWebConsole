@@ -922,11 +922,19 @@ class StatusTap:
             self.on_status(s)
 
     def snapshot(self):
-        """The last status and whether it is still fresh."""
+        """
+        The last status, whether it is still fresh, and when it arrived.
+
+        The arrival time is not a nicety: a command loop that presses a toggle
+        key has to know whether the amplifier has spoken *since* the keystroke,
+        and a wall clock cannot tell it that.
+        """
         with self.lock:
             if self.last is None:
-                return None, False
-            return self.last, time.time() - self.last_at < self.LINK_TIMEOUT
+                return None, False, 0.0
+            return (self.last,
+                    time.time() - self.last_at < self.LINK_TIMEOUT,
+                    self.last_at)
 
 
 # --------------------------------------------------------------------------
@@ -1338,8 +1346,16 @@ class ExpertBridge:
 
     HEARTBEAT_S = 5.0            # republish an unchanged value this often
     HOLD_S = 10.0                # keep a command this long while the link is down
-    RETRY_S = 0.4                # between keystrokes, as the setup walker does
-    MAX_TRIES = 6
+    # Between keystrokes. Measured on the wire: the amplifier ACKs an OPERATE
+    # key in 52 ms and then goes *completely quiet* for about 1.2 s while it
+    # throws the relays - no ACK, no STATUS, though the stream otherwise runs at
+    # eight packets a second. The old 0.4 s therefore pressed a toggle key twice
+    # more inside the window in which it could not possibly have answered, and
+    # the parity of the press count decided where it ended up. Worse, it looked
+    # like a success: the loop saw OPERATE arrive, called itself done, and the
+    # presses already inside the amplifier undid it a second later.
+    SETTLE_S = 1.5
+    MAX_TRIES = 3                # three presses of a toggle; more is not better
     CAT_REFRESH_S = 1.0          # slow catch-up so the PA's display tracks
     TUNE_CONFIRM_S = 1.0
 
@@ -1380,7 +1396,7 @@ class ExpertBridge:
     def _values(self, s):
         """The five published payloads, or None where there is no answer."""
         on = bool(self.hub.source.dtr_state())
-        _, link = self.tap.snapshot()
+        _, link, _ = self.tap.snapshot()
         flags = s["flags"] & 0x7F                # bit 7 means two things by rev
         if on:
             flags |= 0x100
@@ -1446,11 +1462,36 @@ class ExpertBridge:
         if not self._greet:
             return
         name = self._greet.popleft()
-        s, _ = self.tap.snapshot()
-        if s is None:
-            return
-        for topic, payload in self._values(s).items():
+        s, link, _ = self.tap.snapshot()
+        vals = self._values(s) if (s and link) else self._offline_values(s)
+        for topic, payload in vals.items():
             self.node.publish_to(name, topic, payload, con=True)
+
+    def _offline_values(self, s):
+        """
+        What to publish while the amplifier is not answering.
+
+        Bits 8 and 9 of /pa-flags are the daemon's own knowledge, not the
+        amplifier's - whether DTR is up, and whether anything is coming back -
+        and they are precisely the two a consumer needs when no telemetry
+        flows. Publishing only from the STATUS handler made "switched off"
+        indistinguishable from "gone", so a panel whose ON button toggles over
+        the last value it heard kept sending the opposite one, forever: with
+        the amplifier off there is no STATUS, so nothing could ever correct it.
+        The amplifier's own bits go out as zero and the readings as "no
+        answer", which is what they are.
+        """
+        flags = 0x400 if s and s["rev"] == 2 else 0
+        if self.hub.source.dtr_state():
+            flags |= 0x100                       # bit 8, ON
+        # Bit 9, LINK, stays clear - that is the whole point of this set.
+        return {
+            "/pa-flags": struct.pack("<H", flags),
+            "/fwd": struct.pack("<H", 0),
+            "/ref": struct.pack("<H", 0),
+            "/swr": struct.pack("<H", 0),        # 0 = no answer
+            "/band": struct.pack("B", 0),        # 0 = unknown
+        }
 
     # -- incoming: commands -----------------------------------------------
 
@@ -1488,8 +1529,24 @@ class ExpertBridge:
     def tick(self):
         """Called from the TrxNode loop, four times a second."""
         self._drain_greet()
+        self._tick_offline()
         self._tick_freq()
         self._tick_cmds()
+
+    def _tick_offline(self):
+        """Keep /pa-flags going while the amplifier is silent - see above."""
+        if not self.publish_on:
+            return
+        s, link, _ = self.tap.snapshot()
+        if link:
+            return                               # _on_status has it covered
+        now = time.time()
+        for topic, payload in self._offline_values(s).items():
+            prev = self._last.get(topic)
+            if (prev is None or prev[0] != payload
+                    or now - prev[1] >= self.HEARTBEAT_S):
+                self._last[topic] = (payload, now)
+                self.node.publish(topic, payload)
 
     def _tick_freq(self):
         with self.lock:
@@ -1516,7 +1573,7 @@ class ExpertBridge:
             items = list(self._want.items())
         if not items:
             return
-        s, link = self.tap.snapshot()
+        s, link, at = self.tap.snapshot()
         now = time.time()
         for what, want in items:
             if what == "on":
@@ -1533,19 +1590,30 @@ class ExpertBridge:
                     self._done(what)
                 continue
             if what == "tune":
-                self._do_tune(s, want, now)
+                self._do_tune(s, want, now, at)
                 continue
             reached = s["operate"] if what == "operate" else bool(s["flags"] & 0x10)
             if reached == want.value:
                 self._done(what)
                 continue
-            if now - want.sent_at < self.RETRY_S:
+            # OPERATE and PWR are toggle keys, so the one thing that must never
+            # happen is a second press the amplifier has not had the chance to
+            # answer. "Had the chance" is not a timer: it is a STATUS that
+            # arrived at least a settle time after the keystroke went out, which
+            # is the only evidence that the amplifier is talking again and still
+            # disagrees. Nothing at all is sent while it is quiet - the link
+            # going down is already handled above, and until then a silent
+            # amplifier is a busy one.
+            if at - want.sent_at < self.SETTLE_S:
                 continue
             want.tries += 1
             if want.tries > self.MAX_TRIES:
                 log(f"trxnet: /s-{what} gave up - the amplifier did not follow")
                 self._done(what)
                 continue
+            if want.tries > 1:
+                log(f"trxnet: /s-{what} retry {want.tries} - still "
+                    f"{int(reached)}, want {int(want.value)}")
             want.sent_at = now
             self.hub.send_key(KEY_OPERATE if what == "operate" else KEY_MODE)
 
@@ -1559,15 +1627,21 @@ class ExpertBridge:
         else:
             src.set_dtr(on)
 
-    def _do_tune(self, s, want, now):
-        """TUNE is momentary: press once, then check the flag actually rose."""
+    def _do_tune(self, s, want, now, at):
+        """
+        TUNE is momentary: press once, then check the flag actually rose.
+
+        The verdict waits on a STATUS newer than the keystroke for the same
+        reason the toggle keys do - the amplifier falls silent for around a
+        second while it acts, and a wall clock alone would call that a failure.
+        """
         if not want.sent_at:
             want.sent_at = now
             self.hub.send_key(KEY_TUNE)
             return
         if s["flags"] & 0x01:                    # tuning started
             self._done("tune")
-        elif now - want.sent_at >= self.TUNE_CONFIRM_S:
+        elif at - want.sent_at >= self.TUNE_CONFIRM_S:
             log("trxnet: /s-tune had no effect - transmitting, or in STANDBY?")
             self._done("tune")
 

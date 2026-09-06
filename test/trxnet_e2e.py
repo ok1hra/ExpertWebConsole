@@ -17,6 +17,7 @@ import struct
 import sys
 import threading
 import time
+import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -113,7 +114,6 @@ try:
     print("\n5. /hz -> CAT_232 -> zmena pasma")
     # PA jede v Rev 1.0, kde je RS-232 v menu CAT index 4; simulator na CAT_232
     # bez nej nereaguje, stejne jako skutecny zesilovac (protokol str. 7).
-    import urllib.request
     for _ in range(3):                       # CAT: ICOM(1) -> 2 -> 3 -> RS-232(4)
         urllib.request.urlopen(urllib.request.Request(
             "http://127.0.0.1:8099/key", b'{"code":44}',
@@ -157,7 +157,31 @@ try:
     note(len(got) == 5, f"novy peer dostal snimek hned po pripojeni ({len(got)}/5)")
     stop2.set()
 
-    print("\n9. allowlist - kdo smi ovladat zesilovac")
+    print("\n9. vypnuty zesilovac se pozna od ztraceneho")
+    # Bity 8 a 9 zna demon sam ze sebe, ne ze zesilovace. Kdyz se publikovalo
+    # jen ze STATUS handleru, vypnuty zesilovac neposilal vubec nic - a paletka,
+    # jejiz tlacitko ON je prepinac nad naposledy slysenou hodnotou, pak trvale
+    # posilala tu opacnou: bez STATUSu ji nemelo co opravit.
+    def power(on):
+        urllib.request.urlopen(urllib.request.Request(
+            "http://127.0.0.1:8099/power",
+            b'{"dtr": true}' if on else b'{"dtr": false}',
+            {"Content-Type": "application/json"}), timeout=3).read()
+
+    power(False)
+    with seen_lock:
+        seen.pop("/pa-flags", None)
+    wait(lambda s: "/pa-flags" in s, "/pa-flags chodi dal i s vypnutym PA", t=8)
+    with seen_lock:
+        snap = dict(seen)
+    note(not flags(snap) & 0x100, "bit 8 ON je nula - je opravdu vypnuty")
+    note(not flags(snap) & 0x200, "bit 9 LINK je nula - nic se nevraci")
+    note(u16(snap, "/fwd") == 0, "/fwd je nula, ne posledni slysena hodnota")
+    power(True)
+    wait(lambda s: flags(s) & 0x300 == 0x300, "po zapnuti se ON i LINK vratily",
+         t=8)
+
+    print("\n10. allowlist - kdo smi ovladat zesilovac")
     # Bez site: staci sama rozhodovaci funkce mostu.
     guarded = E.ExpertBridge(None, E.StatusTap(), E.TrxNode("PA.09", PORT),
                              subscribe_on=False, allow=("705.01", "OI3"))
