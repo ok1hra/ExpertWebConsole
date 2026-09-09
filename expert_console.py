@@ -1393,8 +1393,25 @@ class ExpertBridge:
 
     # -- outgoing: the amplifier's state ----------------------------------
 
+    @staticmethod
+    def _temp_c(s):
+        """
+        The amplifier's temperature in whole °C, whatever scale it reports in.
+
+        Rev. 2.0 says which with FLAGS bit 7 (T_SCALE, 1 = °C); Rev. 1.0 uses
+        that same bit for PA_PROT and does not say, so °C is assumed there --
+        the same assumption the web console makes (index.html, flags.celsius).
+
+        The conversion happens HERE rather than in every consumer because this
+        is the only place that still knows the scale: bit 7 is masked out of
+        /pa-flags before publishing, precisely because it means two different
+        things depending on revision.
+        """
+        celsius = bool(s["flags"] & 0x80) if s["rev"] == 2 else True
+        return s["temp"] if celsius else (s["temp"] - 32) * 5.0 / 9.0
+
     def _values(self, s):
-        """The five published payloads, or None where there is no answer."""
+        """The six published payloads, or None where there is no answer."""
         on = bool(self.hub.source.dtr_state())
         _, link, _ = self.tap.snapshot()
         flags = s["flags"] & 0x7F                # bit 7 means two things by rev
@@ -1420,6 +1437,14 @@ class ExpertBridge:
             "/ref": struct.pack("<H", min(0xFFFF, int(round(s["ref"] * 10)))),
             "/swr": struct.pack("<H", swr_raw),
             "/band": struct.pack("B", band),
+            # °C x 100 in an int16 -- the encoding /temp already uses on this
+            # network, so one shape means one thing whatever measures it. A
+            # SEPARATE topic from /temp all the same: that one is the WX node's
+            # outdoor reading, and a monitor or subscriber meeting both under
+            # one name would report a heatsink as the weather. Exactly the
+            # /flags vs /pa-flags split, for the same reason.
+            "/pa-temp": struct.pack("<h", max(-32768, min(32767,
+                                              int(round(self._temp_c(s) * 100))))),
         }
 
     def _on_status(self, s):
@@ -1491,6 +1516,11 @@ class ExpertBridge:
             "/ref": struct.pack("<H", 0),
             "/swr": struct.pack("<H", 0),        # 0 = no answer
             "/band": struct.pack("B", 0),        # 0 = unknown
+            # No sentinel for "unknown": every temperature an int16 can hold is
+            # a temperature something could really be. What says the reading is
+            # meaningless is bit 9, LINK, being clear right beside it in this
+            # same snapshot -- which is the whole point of this set.
+            "/pa-temp": struct.pack("<h", 0),
         }
 
     # -- incoming: commands -----------------------------------------------

@@ -62,12 +62,16 @@ def u16(snap, topic):
     return struct.unpack("<H", snap[topic])[0] if topic in snap else None
 
 
+def i16(snap, topic):
+    return struct.unpack("<h", snap[topic])[0] if topic in snap else None
+
+
 # -- a peer of our own, built from the same class the daemon uses -------------
 
 # bind_port 0: an ephemeral port of our own, so unicast to 5799
 # reaches the daemon rather than being split between two sockets
 peer = E.TrxNode("TST.02", PORT, bind_port=0)
-for topic in ("/pa-flags", "/fwd", "/ref", "/swr", "/band"):
+for topic in ("/pa-flags", "/fwd", "/ref", "/swr", "/band", "/pa-temp"):
     def handler(_from, data, topic=topic):
         with seen_lock:
             seen[topic] = data
@@ -84,11 +88,17 @@ try:
     note(peer.peer_count() == 1, "prave jeden peer")
 
     print("\n2. telemetrie chodi bez otevreneho prohlizece")
-    wait(lambda s: len(s) >= 5, "vsech pet topicu doslo")
+    wait(lambda s: len(s) >= 6, "vsech sest topicu doslo")
     with seen_lock:
         snap = dict(seen)
     note(len(snap.get("/pa-flags", b"")) == 2, "/pa-flags jsou dva bajty")
     note(len(snap.get("/band", b"")) == 1, "/band je jeden bajt")
+    note(len(snap.get("/pa-temp", b"")) == 2, "/pa-temp jsou dva bajty")
+    # Simulator jede v Rev. 1.0 (kod statusu 0x80), kde bit 7 znamena PA_PROT a
+    # o stupnici nerika nic - predpoklada se tedy °C a prepocet nic nedela.
+    # Kontroluje se rozsah, ne cislo: _measures() teplotu hybe podle zateze.
+    note(2000 <= i16(snap, "/pa-temp") <= 12000,
+         f"/pa-temp je °C x 100 v rozumnem rozsahu ({i16(snap, '/pa-temp')})")
     note(flags(snap) & 0x200, "bit 9 LINK - STATUS pakety tecou")
     note(flags(snap) & 0x100, "bit 8 ON - simulator je zapnuty")
     note(not flags(snap) & 0x80, "bit 7 je vzdy nula")
@@ -145,16 +155,16 @@ try:
     print("\n8. uvitaci snimek novemu peerovi")
     fresh = E.TrxNode("TST.03", PORT, bind_port=0)
     got = {}
-    for topic in ("/pa-flags", "/fwd", "/ref", "/swr", "/band"):
+    for topic in ("/pa-flags", "/fwd", "/ref", "/swr", "/band", "/pa-temp"):
         def h(_from, data, topic=topic):
             got[topic] = data
         fresh.subscribe(topic, h)
     stop2 = threading.Event()
     threading.Thread(target=fresh.serve, args=(stop2,), daemon=True).start()
     end = time.time() + 5
-    while time.time() < end and len(got) < 5:
+    while time.time() < end and len(got) < 6:
         time.sleep(0.05)
-    note(len(got) == 5, f"novy peer dostal snimek hned po pripojeni ({len(got)}/5)")
+    note(len(got) == 6, f"novy peer dostal snimek hned po pripojeni ({len(got)}/6)")
     stop2.set()
 
     print("\n9. vypnuty zesilovac se pozna od ztraceneho")
@@ -177,6 +187,7 @@ try:
     note(not flags(snap) & 0x100, "bit 8 ON je nula - je opravdu vypnuty")
     note(not flags(snap) & 0x200, "bit 9 LINK je nula - nic se nevraci")
     note(u16(snap, "/fwd") == 0, "/fwd je nula, ne posledni slysena hodnota")
+    note(i16(snap, "/pa-temp") == 0, "/pa-temp je nula - zadne posledni cteni")
     power(True)
     wait(lambda s: flags(s) & 0x300 == 0x300, "po zapnuti se ON i LINK vratily",
          t=8)

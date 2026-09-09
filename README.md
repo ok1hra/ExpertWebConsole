@@ -223,6 +223,7 @@ Payloads are raw little-endian, as everywhere in TrxNet.
 | `/ref` | u16 | reflected power, W × 10, instantaneous |
 | `/swr` | u16 | SWR × 100; `0` = no answer, `65535` = ∞ |
 | `/band` | u8 | metres: 160, 80, 40, 30, 20, 17, 15, 12, 10, 6 |
+| `/pa-temp` | i16 | temperature, **°C × 100** — always °C, whatever the amplifier reports in |
 
     /pa-flags
     bit  0  TUNE      ┐
@@ -246,6 +247,20 @@ Payloads are raw little-endian, as everywhere in TrxNet.
 > "SPLIT | AFC | NR". A topic of our own means anything that does not know the
 > amplifier prints raw hex, which is at least visibly undecoded.
 
+> The same applies to `/pa-temp`, which is why it is not `/temp`: the WX node
+> publishes an outdoor reading under that name, in the very same `int16` °C ×
+> 100 encoding, and the Monitor decodes it. One name would have a heatsink at
+> 58 °C reported as the weather. The **encoding** is deliberately identical
+> though — a temperature has one shape on this network whatever measures it.
+>
+> The scale conversion happens here, not in the consumers. The amplifier
+> reports whole degrees in whichever scale its menu is set to; Rev. 2.0 says
+> which in `FLAGS` bit 7, Rev. 1.0 uses that bit for something else and does
+> not say, so °C is assumed there — the same assumption the web console makes.
+> Since bit 7 is masked out of `/pa-flags` (it would mean two things on one
+> wire), this daemon is the last place that still knows the scale, so it is the
+> only place that can convert.
+
 | Subscribed | Type | Effect |
 |---|---|---|
 | `/hz` | u32 | the transceiver's frequency in Hz → `CAT_232` |
@@ -256,7 +271,9 @@ Payloads are raw little-endian, as everywhere in TrxNet.
 
 While transmitting, `/fwd` `/ref` `/swr` go out with every STATUS packet — five
 to eight a second, which is the point of an instantaneous reading. Otherwise
-they are sent on change plus a heartbeat every five seconds. A peer that joins
+they are sent on change plus a heartbeat every five seconds. `/pa-temp` is not
+in that live set on purpose: a heatsink does not move between packets, and
+while it does move — under a long transmission — the change itself publishes. A peer that joins
 gets the whole set at once, as `TRX_CON`.
 
 **With the amplifier switched off the topics keep going**, on the same
