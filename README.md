@@ -339,9 +339,39 @@ antenna happens to be selected.
 
 restricts commands to those names. Be clear about what that buys: the sender's
 name is carried unsigned in the packet, so an allow list guards against a
-misconfigured device, **not** against an attacker. It is not optional in one
-case though — `/hz` is published by the OI3 keyer as well as the IC-705, and
-without a list the amplifier would follow whichever spoke last.
+misconfigured device, **not** against an attacker.
+
+Give the whole list in **one** argument. `--trxnet-allow` is an ordinary
+option, not a repeatable one, so writing it twice keeps only the second — and
+the names dropped that way fail exactly like a misconfigured peer: their
+packets arrive and vanish. `/health` prints the list the daemon is actually
+using.
+
+### Which radio retunes it
+
+Commands and frequency are two different questions with two different answers,
+so they have two settings:
+
+    --trxnet-allow     "705.01"     # who may press the buttons
+    --trxnet-freq-from "OI3.02"     # which radio is wired to the amplifier
+
+`/hz` is a **state** topic: the profile (`INTEGRATION.md` §6.2b) calls it owned
+by *a* device, not by *the* device, and both the 705 interface and the OI3
+keyer publish it. An amplifier that accepts it from both follows whichever of
+them moved last — which, in a station where one radio drives the PA and the
+other is on a second antenna, means a kilowatt tuned for the wrong band with
+every setting still reading healthy.
+
+`--trxnet-freq-from` takes **one** name, because how many radios stand in front
+of an amplifier is a physical fact with one answer; a list is refused at
+startup rather than quietly restoring the collision. The name does not have to
+appear in `--trxnet-allow`: in the ordinary station they are two different
+devices — the web backend presses the buttons, the keyer supplies the
+frequency. Leaving it empty falls back to the allow list, which is what every
+installation that predates the setting already does.
+
+A `/hz` refused this way is logged **once per sender**, with both the name that
+was dropped and the name that is expected.
 
 ### Diagnostics
 
@@ -353,6 +383,11 @@ without a list the amplifier would follow whichever spoke last.
 `tableFull` is the one to look at when a device is missing: the peer table
 filled and somebody was dropped. `--trxnet-prio "705 OI3"` protects the names
 that matter.
+
+`allow` and `freqFrom` sit beside `subscribeOn` because those three are the
+settings that drop a packet while everything else reads healthy — the peer is
+in the table, `cat_ok` is true, the counters climb, and the frames still go
+nowhere. Read them first when the amplifier is present but does not follow.
 
 ## Losing the address bar and tabs
 
@@ -394,7 +429,8 @@ does not need `mod_proxy_wstunnel`:
     ExecStart=/opt/expert/expert_console.py --port /dev/ttyUSB.pa \
               --raw-port 7373 --listen 127.0.0.1 --http-port 8080 \
               --trxnet --trxnet-id 01 --trxnet-subscribe \
-              --trxnet-allow "705.01" --trxnet-prio "705 OI3"
+              --trxnet-allow "705.01" --trxnet-freq-from "OI3.02" \
+              --trxnet-prio "705 OI3"
     Restart=always
     User=dan
 
@@ -445,6 +481,9 @@ With `--trxnet --trxnet-subscribe`, in this order:
    toggle it
 8. `/hz` from a live transceiver → the bands follow, `/band` matches the front
    panel
+8b. with a **second** transceiver on the network, tune that one too: with
+   `--trxnet-freq-from` naming the first, `/band` must not move, and the log
+   says once whose `/hz` it dropped
 9. `/s-tune` **into a dummy load**, last of all
 
 ## Tests
@@ -453,7 +492,9 @@ With `--trxnet --trxnet-subscribe`, in this order:
     ./test/run.sh --e2e    # plus end-to-end against the simulator
 
 `decode_test.py` covers the daemon's own decoder and `subband_test.py` the
-tuner's sub-band table; `toggle_test.py` drives the command loop against an
+tuner's sub-band table; `freq_source_test.py` pins down which peer may retune
+the amplifier and which may command it, a gate whose only symptom is a frame
+that does not go out; `toggle_test.py` drives the command loop against an
 amplifier that falls silent for the measured 1.2 s, which the simulator cannot
 show because it flips on the byte; `trxnet_e2e.py` joins a real TrxNet peer to
 the simulator and drives the amplifier over the network — including with the
@@ -509,7 +550,8 @@ gitignored, and running `--bundle` on a bundle is refused.
 | `--trxnet-subscribe` | off | act on commands from the network |
 | `--trxnet-no-publish` | off | announce presence but publish no state |
 | `--trxnet-prio` | — | name prefixes to keep when the peer table fills |
-| `--trxnet-allow` | — | peer names allowed to command the amplifier; empty = anyone |
+| `--trxnet-allow` | — | peer names allowed to command the amplifier, whole list in ONE argument; empty = anyone |
+| `--trxnet-freq-from` | — | the one peer whose `/hz` retunes the amplifier; empty = anyone in `--trxnet-allow`, last publisher wins |
 
 ## Scope
 

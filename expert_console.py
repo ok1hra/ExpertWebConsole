@@ -14,7 +14,8 @@ test/fixture.log the JavaScript decoder is tested with.
   ./expert_console.py --port /dev/ttyUSB.pa --raw-port 7373
   ./expert_console.py --simulate
   ./expert_console.py --replay /tmp/expert1k.log
-  ./expert_console.py --port /dev/ttyUSB.pa --trxnet --trxnet-subscribe
+  ./expert_console.py --port /dev/ttyUSB.pa --trxnet --trxnet-subscribe \
+                      --trxnet-allow "705.01" --trxnet-freq-from "OI3.02"
 
 The only dependency is pyserial, and only for --port:
   apt install python3-serial
@@ -1362,13 +1363,14 @@ class ExpertBridge:
     CAT_RS232 = {1: 4, 2: 6}     # menu index of RS-232, by protocol revision
 
     def __init__(self, hub, tap, node, publish_on=True, subscribe_on=False,
-                 allow=()):
+                 allow=(), freq_from=()):
         self.hub = hub
         self.tap = tap
         self.node = node
         self.publish_on = publish_on
         self.subscribe_on = subscribe_on
         self.allow = tuple(allow)
+        self.freq_from = tuple(freq_from)
         self.lock = threading.Lock()
 
         self._last = {}                          # topic -> (payload, time)
@@ -1381,6 +1383,7 @@ class ExpertBridge:
         self._tune_at = 0.0
         self.cat_ok = None                       # None = not known yet
         self._cat_warned = False
+        self._hz_warned = set()                  # senders logged once, see _on_hz
 
         tap.on_status = self._on_status
         node.on_peer = self._on_peer
@@ -1525,16 +1528,63 @@ class ExpertBridge:
 
     # -- incoming: commands -----------------------------------------------
 
+    @staticmethod
+    def _name_matches(sender, patterns):
+        """
+        Prefix match on the device name, case-insensitively.
+
+        One matcher for both gates below, so "OI3" keeps meaning the same thing
+        whichever setting it is written in. A prefix rather than the whole name
+        because a network with a single keyer is entitled to say OI3 and be
+        done; write the full OI3.02 when there are two of them.
+        """
+        return any(sender.upper().startswith(p.upper()) for p in patterns)
+
     def _allowed(self, sender):
+        """Who may COMMAND the amplifier - the /s-x topics."""
         if not self.allow:
             return True
-        return any(sender.upper().startswith(a.upper()) for a in self.allow)
+        return self._name_matches(sender, self.allow)
+
+    def _freq_source(self, sender):
+        """
+        Who may RETUNE it - the /hz topic. A different question.
+
+        INTEGRATION.md section 6.2b: a state topic is owned by *a* device, not
+        by *the* device. Both 705 and OI3 publish /hz, so anything that ACTS on
+        one - tunes to it, steps a rotator to it, switches an antenna on it -
+        MUST be able to say which peer it takes it from. Without that, an
+        amplifier wired behind one radio follows whichever of the two moved
+        last, and the operator gets a kilowatt on the wrong band with nothing
+        anywhere saying why.
+
+        Deliberately NOT folded into the allow list, and deliberately not
+        requiring the source to be in it: the allow list answers "who may press
+        the buttons", this answers "which radio is in front of the amplifier",
+        and in the ordinary installation those are two different devices - the
+        web backend presses the buttons, the keyer supplies the frequency.
+
+        Empty falls back to the allow list, which is what every install that
+        predates this setting already has.
+        """
+        if not self.freq_from:
+            return self._allowed(sender)
+        return self._name_matches(sender, self.freq_from)
 
     def _on_hz(self, sender, data):
         if len(data) < 4:
             return
-        if not self._allowed(sender):
-            log(f"trxnet: /hz from {sender} ignored (not in the allow list)")
+        if not self._freq_source(sender):
+            # Once per sender. The other radio publishes on every turn of its
+            # VFO, so logging each one would bury the line that matters - and
+            # this line matters: a silently dropped /hz is precisely the
+            # failure that sends somebody hunting through two devices. The cap
+            # bounds a set whose keys come off the wire.
+            if sender not in self._hz_warned and len(self._hz_warned) < 8:
+                self._hz_warned.add(sender)
+                why = (f"the frequency source is {' '.join(self.freq_from)}"
+                       if self.freq_from else "not in the allow list")
+                log(f"trxnet: /hz from {sender} ignored ({why})")
             return
         with self.lock:
             self._want_hz = struct.unpack_from("<I", data)[0]
@@ -1690,6 +1740,14 @@ class ExpertBridge:
                 "enabled": True,
                 "publishOn": self.publish_on,
                 "subscribeOn": self.subscribe_on,
+                # Beside subscribeOn because section 6.2b asks for the source
+                # restriction to be reachable wherever subscribe_enable is, and
+                # because these two are the settings that drop a packet without
+                # anything else changing: every other field can read healthy
+                # while one of them quietly refuses the traffic. Product
+                # specific, beyond the section 8.2 core.
+                "allow": list(self.allow),
+                "freqFrom": list(self.freq_from),
                 "peerCount": len(peers),
                 "peerMax": TrxNode.MAX_PEERS,
                 "tableFull": len(peers) >= TrxNode.MAX_PEERS,
@@ -1999,6 +2057,17 @@ def start_trxnet(hub, args, stop):
         sys.exit("--trxnet-id 00 is the reserved 'disabled' value - "
                  "pick another ID, or leave out --trxnet")
 
+    # One name, and it is worth refusing a list rather than quietly accepting
+    # one: a list brings back exactly the collision this setting exists to end,
+    # and it would do it silently. A typo'd single name is caught by the
+    # once-per-sender line in _on_hz.
+    freq_from = args.trxnet_freq_from.split()
+    if len(freq_from) > 1:
+        sys.exit("--trxnet-freq-from takes ONE peer name, not a list "
+                 f"({args.trxnet_freq_from!r}) - two radios feeding one "
+                 "amplifier's frequency is the collision this setting is for. "
+                 "Name the radio that is wired to the PA.")
+
     name = f"{args.trxnet_type}.{net_id:02x}"
     node = TrxNode(name, args.trxnet_port, TrxNode.parse_prio(args.trxnet_prio))
     tap = StatusTap()
@@ -2006,15 +2075,23 @@ def start_trxnet(hub, args, stop):
     bridge = ExpertBridge(hub, tap, node,
                           publish_on=not args.trxnet_no_publish,
                           subscribe_on=args.trxnet_subscribe,
-                          allow=args.trxnet_allow.split())
+                          allow=args.trxnet_allow.split(),
+                          freq_from=freq_from)
     threading.Thread(target=node.serve, args=(stop, bridge.tick),
                      daemon=True).start()
     log(f"trxnet: {name}, publish {'on' if bridge.publish_on else 'off'}, "
         f"subscribe {'on' if bridge.subscribe_on else 'off'}"
-        + (f", allow {' '.join(bridge.allow)}" if bridge.allow else ""))
+        + (f", allow {' '.join(bridge.allow)}" if bridge.allow else "")
+        + (f", /hz from {' '.join(bridge.freq_from)}" if bridge.freq_from else ""))
     if bridge.subscribe_on and not bridge.allow:
         log("trxnet: any device on the segment can command the amplifier "
             "- see --trxnet-allow")
+    # The collision has no symptom of its own: both radios are configured, both
+    # are entitled to publish, and the amplifier simply follows the one that
+    # moved last. Say so at startup, where it is cheap to read.
+    if bridge.subscribe_on and not bridge.freq_from and len(bridge.allow) > 1:
+        log("trxnet: more than one peer may retune the amplifier and the last "
+            "/hz wins - name the radio wired to it with --trxnet-freq-from")
     return bridge
 
 
@@ -2076,9 +2153,17 @@ def main():
                         'table fills, e.g. "705 OI3"')
     t.add_argument("--trxnet-allow", default="", metavar="LIST",
                    help="space-separated peer names allowed to command the "
-                        "amplifier; empty means anyone. The sender's name is "
-                        "unsigned, so this guards against a misconfigured "
-                        "device, not against an attacker")
+                        "amplifier; empty means anyone. Give the whole list in "
+                        "ONE argument - repeating the option keeps only the "
+                        "last. The sender's name is unsigned, so this guards "
+                        "against a misconfigured device, not against an "
+                        "attacker")
+    t.add_argument("--trxnet-freq-from", default="", metavar="NAME",
+                   help="the one peer whose /hz retunes the amplifier, e.g. "
+                        'OI3.02. Which radio stands in front of the amplifier '
+                        "is a physical fact with a single answer, so this takes "
+                        "one name, not a list. Empty falls back to "
+                        "--trxnet-allow, where the last peer to publish wins")
     args = p.parse_args()
 
     if args.bundle:

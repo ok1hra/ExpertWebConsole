@@ -29,6 +29,10 @@ echo "== prepinaci klavesy proti mlcicimu zesilovaci =="
 python3 toggle_test.py
 
 echo
+echo "== zdroj kmitoctu vs. povolene prikazy =="
+python3 freq_source_test.py
+
+echo
 echo "== vykreslovani (DOM shim) =="
 python3 make-fixture.py >/dev/null
 node render.test.js
